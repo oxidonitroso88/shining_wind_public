@@ -1,0 +1,265 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 1e8b342..0a4e2ed 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-FileContributor: Runar Heyer
+ // SPDX-License-Identifier: LGPL-3.0+
+ 
++#include <vector>
+ #include "page_tracker.hpp"
+ #include "gs_interface.hpp"
+ #include "gs_util.hpp"
+@@ -1282,8 +1283,39 @@ GSInterface::ReplacementBinding GSInterface::find_replacement_image(const Textur
+ 			return binding;
+ 		}
+ 
++		// An upscaler smears the hard alpha edge of a cut-out (a hole in a picture that another sprite fills) into a ramp several HD texels wide.
++		// The ramp sticks out of the hole, where the sprite that fills it does not draw, and shows the background as a thin line.
++		// When the alpha of the image is almost binary, steepen the ramp around 50% (alpha 0x40 of 0x80) so that the edge falls on the same texel row as the sprite that fills it.
++		std::vector<uint8_t> sharpened;
++		const uint8_t *upload = pixels;
++		{
++			static const int steepness = getenv("PS2X_HD_ALPHA_SHARPEN") ? atoi(getenv("PS2X_HD_ALPHA_SHARPEN")) : 4;
++			if (steepness > 1)
++			{
++				const size_t count = size_t(rep.width) * rep.height;
++				size_t partial = 0;
++				for (size_t i = 0; i < count; i++)
++					partial += uint32_t(pixels[4 * i + 3] - 1u) < 127u; // alpha is in GS range here: 0x80 = opaque
++				static const bool alpha_dbg = getenv("PS2X_HD_ALPHA_DEBUG") != nullptr;
++				if (alpha_dbg)
++					fprintf(stderr, "[hdalpha] %ux%u partial=%zu of %zu (%.1f%%) %s\n", rep.width, rep.height, partial, count, 100.0 * double(partial) / double(count),
++					        (partial && partial * 100 <= count * 12) ? "sharpen" : "keep");
++				// Images with real gradients in alpha (glows, shadows, shaded panels) are left alone.
++				if (partial && partial * 100 <= count * 12)
++				{
++					sharpened.assign(pixels, pixels + count * 4);
++					for (size_t i = 0; i < count; i++)
++					{
++						int a = (int(sharpened[4 * i + 3]) - 64) * steepness + 64;
++						sharpened[4 * i + 3] = uint8_t(a < 0 ? 0 : (a > 128 ? 128 : a));
++					}
++					upload = sharpened.data();
++				}
++			}
++		}
++
+ 		Vulkan::ImageCreateInfo info = Vulkan::ImageCreateInfo::immutable_2d_image(rep.width, rep.height, VK_FORMAT_R8G8B8A8_UNORM);
+-		Vulkan::ImageInitialData initial = { pixels, rep.width, rep.height };
++		Vulkan::ImageInitialData initial = { upload, rep.width, rep.height };
+ 		auto image = renderer.get_device()->create_image(info, &initial);
+ 		if (!image)
+ 		{
+@@ -1322,6 +1354,8 @@ GSInterface::ReplacementBinding GSInterface::find_replacement_image(const Textur
+ 	binding.origin_y = rep.origin_y;
+ 	binding.width = rep.orig_width;
+ 	binding.height = rep.orig_height;
++	binding.scale_x = rep.scale_x;
++	binding.scale_y = rep.scale_y;
+ 	return binding;
+ }
+ 
+@@ -1910,7 +1944,9 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		info.info.arrayed = int(desc.samples > 1);
+ 		info.info.flags = long_term_cache_texture ? TEX_INFO_LONG_TERM_REFERENCE : 0;
+ 		if (replacement)
+-			info.info.flags |= TEX_INFO_HD_REPLACEMENT | (replacement_linear ? TEX_INFO_HD_REPLACEMENT_LINEAR : 0);
++			info.info.flags |= TEX_INFO_HD_REPLACEMENT | (replacement_linear ? TEX_INFO_HD_REPLACEMENT_LINEAR : 0) |
++			                   int(std::min(replacement_binding.scale_x, 255u) << TEX_INFO_HD_SCALE_X_SHIFT) |
++			                   int(std::min(replacement_binding.scale_y, 127u) << TEX_INFO_HD_SCALE_Y_SHIFT);
+ 		if (info.info.arrayed)
+ 			render_pass.tex_infos_has_super_samples = true;
+ 
+@@ -1956,6 +1992,8 @@ void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const
+ 			auto &info = render_pass.tex_infos[tex_index].info;
+ 			if ((info.flags & TEX_INFO_HD_REPLACEMENT_LINEAR) != 0)
+ 				p.tex |= TEX_SAMPLER_MAG_LINEAR_BIT;
++			if ((info.flags & TEX_INFO_HD_REPLACEMENT) != 0)
++				p.tex |= TEX_HD_REPLACEMENT_BIT;
+ 			if (info.arrayed)
+ 			{
+ 				p.tex |= TEX_PER_SAMPLE_BIT;
+@@ -2830,7 +2868,9 @@ void GSInterface::drawing_kick_append()
+ 			const uint32_t hd_tex_index = (uint32_t(prim_attr.tex) >> TEX_TEXTURE_INDEX_OFFSET) & ((1u << TEX_TEXTURE_INDEX_BITS) - 1u);
+ 			if (hd_tex_index < MaxTextures && hd_tex_index < render_pass.tex_infos.size() &&
+ 			    (render_pass.tex_infos[hd_tex_index].info.flags & TEX_INFO_HD_REPLACEMENT) != 0)
++			{
+ 				prim_attr.state &= ~(1u << STATE_BIT_SNAP_ATTRIBUTE);
++			}
+ 		}
+ 	}
+ 	else if (is_line)
+@@ -4701,6 +4741,29 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 			hi = muglm::max(hi, uv1);
+ 		}
+ 
++		static const bool dbg = getenv("PS2X_GS_PROMOTE_DEBUG") != nullptr;
++		if (dbg)
++		{
++			fprintf(stderr, "[promote] fbp=%u inst=%u prims=%u valid=%d lo=(%d,%d) hi=(%d,%d) fbw=%u psm=%u\n", fbp, instance,
++			        rp.num_primitives, int(is_valid_blit), lo.x, lo.y, hi.x, hi.y, uint32_t(inst.fb.frame.desc.FBW), uint32_t(inst.fb.frame.desc.PSM));
++			for (uint32_t prim = 0; prim < rp.num_primitives && prim < 8; prim++)
++			{
++				auto &p0 = render_pass.positions[3 * prim + 0].pos;
++				auto &p1 = render_pass.positions[3 * prim + 1].pos;
++				auto &a0 = render_pass.attributes[3 * prim + 0];
++				auto &a1 = render_pass.attributes[3 * prim + 1];
++				fprintf(stderr, "[promote]   prim%u pos0=(%.2f,%.2f) pos1=(%.2f,%.2f) uv0=(%.2f,%.2f) uv1=(%.2f,%.2f) inst=%u\n", prim,
++				        p0.x / 16.0f, p0.y / 16.0f, p1.x / 16.0f, p1.y / 16.0f,
++				        float(a0.uv.x) / 16.0f, float(a0.uv.y) / 16.0f, float(a1.uv.x) / 16.0f, float(a1.uv.y) / 16.0f,
++				        (render_pass.prim[prim].state >> STATE_VERTEX_RENDER_PASS_INSTANCE_OFFSET) & ((1 << STATE_VERTEX_RENDER_PASS_INSTANCE_COUNT) - 1));
++			}
++			if (promoted_tex_index != UINT32_MAX && promoted_tex_index < rp.num_textures)
++			{
++				auto &ti = render_pass.tex_infos[promoted_tex_index].view->get_image();
++				fprintf(stderr, "[promote]   tex %ux%u layers=%u levels=%u\n", ti.get_width(), ti.get_height(), ti.get_create_info().layers, ti.get_create_info().levels);
++			}
++		}
++
+ 		if (!is_valid_blit)
+ 			continue;
+ 
+@@ -4820,6 +4883,15 @@ ScanoutResult GSInterface::vsync(const VSyncInfo &info_)
+ 	renderer.set_field_aware_super_sampling(render_pass.field_aware_rendering);
+ 
+ 
++	if (getenv("PS2X_GS_PROMOTE_DEBUG"))
++		fprintf(stderr, "[vsync] en1=%u en2=%u dispfb1 fbp=%u fbw=%u dbx=%u dby=%u disp1 dx=%u dy=%u dw=%u dh=%u magh=%u magv=%u | dispfb2 fbp=%u dby=%u | ffmd=%u int=%u prom1=%d(%u) prom2=%d\n",
++		        uint32_t(priv_registers.pmode.EN1), uint32_t(priv_registers.pmode.EN2),
++		        uint32_t(priv_registers.dispfb1.FBP), uint32_t(priv_registers.dispfb1.FBW), uint32_t(priv_registers.dispfb1.DBX), uint32_t(priv_registers.dispfb1.DBY),
++		        uint32_t(priv_registers.display1.DX), uint32_t(priv_registers.display1.DY), uint32_t(priv_registers.display1.DW), uint32_t(priv_registers.display1.DH),
++		        uint32_t(priv_registers.display1.MAGH), uint32_t(priv_registers.display1.MAGV),
++		        uint32_t(priv_registers.dispfb2.FBP), uint32_t(priv_registers.dispfb2.DBY),
++		        uint32_t(priv_registers.smode2.FFMD), uint32_t(priv_registers.smode2.INT),
++		        int(promoted1 != nullptr), promoted1 ? promoted1->get_height() : 0u, int(promoted2 != nullptr));
+ 	auto result = renderer.vsync(priv_registers, info,
+ 	                             sampling_rate_x_log2, sampling_rate_y_log2,
+ 								 promoted1, promoted2);
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 819ec35..2aa4b81 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -659,6 +659,7 @@ private:
+ 		bool linear = false;
+ 		uint32_t origin_x = 0, origin_y = 0; // replaced rectangle in original texture space
+ 		uint32_t width = 0, height = 0;
++		uint32_t scale_x = 1, scale_y = 1; // HD factor of the image over the original texels
+ 	};
+ 	ReplacementBinding find_replacement_image(const TextureDescriptor &desc, const TEX0Bits &game_tex0, const ivec4 &uv_bb);
+ 
+diff --git a/gs/shaders/data_structures.h b/gs/shaders/data_structures.h
+index 439aaa4..ff066f3 100644
+--- a/gs/shaders/data_structures.h
++++ b/gs/shaders/data_structures.h
+@@ -109,6 +109,9 @@ CONSTEXPR int TEX_INFO_LONG_TERM_REFERENCE = 0x2;
+ // Host side only (never read by the shaders): the bound image is a host provided HD replacement (see TextureReplacer).
+ CONSTEXPR int TEX_INFO_HD_REPLACEMENT = 0x100;
+ CONSTEXPR int TEX_INFO_HD_REPLACEMENT_LINEAR = 0x200;
++// HD factor of the replacement over the original texels (0 = not a replacement). The shader needs it to clamp at the edge of the HD image.
++CONSTEXPR int TEX_INFO_HD_SCALE_X_SHIFT = 16;
++CONSTEXPR int TEX_INFO_HD_SCALE_Y_SHIFT = 24;
+ 
+ CONSTEXPR int PGS_FB_SWIZZLE_WIDTH_LOG2 = 3;
+ CONSTEXPR int PGS_FB_SWIZZLE_HEIGHT_LOG2 = 3;
+@@ -254,6 +257,8 @@ CONSTEXPR int TEX_MAX_MIP_LEVEL_BITS = 3;
+ CONSTEXPR int TEX_PER_SAMPLE_BIT = 1 << 24;
+ CONSTEXPR int TEX_SAMPLE_MAPPING_BIT = 1 << 25;
+ CONSTEXPR int TEX_SAMPLE_RESOLVED_BIT = 1 << 26;
++// The bound texture is a host provided HD replacement (set by the host together with per-sample attribute interpolation).
++CONSTEXPR int TEX_HD_REPLACEMENT_BIT = 1 << 27;
+ /////
+ 
+ // PrimitiveAttribute::tex2
+diff --git a/gs/shaders/triangle_setup.comp b/gs/shaders/triangle_setup.comp
+index 4cb4248..5016749 100644
+--- a/gs/shaders/triangle_setup.comp
++++ b/gs/shaders/triangle_setup.comp
+@@ -29,6 +29,7 @@
+ #include "intersect.h"
+ #include "utils.h"
+ 
++// Fraction of the average sample offset removed from the UV of HD replacements (experiment).
+ layout(local_size_x = 64) in;
+ 
+ layout(constant_id = 0) const int SAMPLING_RATE_X_LOG2 = 0;
+@@ -817,6 +818,25 @@ void main_inner(uint index)
+         }
+     }
+ 
++    if (SAMPLING_RATE_Y_LOG2 != 0 &&
++        (primitive_attr.data[index].tex & TEX_HD_REPLACEMENT_BIT) != 0 &&
++        (primitive_attr.data[index].state & (1u << STATE_BIT_SNAP_ATTRIBUTE)) == 0)
++    {
++        // HD replacement sampled per sample: same phase correction as for super-sampled textures above.
++        // Samples sit at k / rate from the pixel corner, so without this the average coordinate is ahead of the single sampled one
++        // and the whole HD image appears shifted up and to the left by that average offset.
++        vec2 bottom_right_sample =
++            float(1 << PGS_RASTER_SUBSAMPLE_BITS) *
++            get_average_sampling_offset(SAMPLING_RATE_X_LOG2, SAMPLING_RATE_Y_LOG2);
++
++        ivec2 b = plane_b.xy;
++        ivec2 c = plane_c.xy;
++        float di_dcorner = float(b.x + b.y) * bottom_right_sample.x;
++        float dj_dcorner = float(c.x + c.y) * bottom_right_sample.y;
++        primitive_setup.data[index].error_i = error_i - di_dcorner * inv_area_scaled;
++        primitive_setup.data[index].error_j = error_j - dj_dcorner * inv_area_scaled;
++    }
++
+     if (SAMPLING_RATE_Y_LOG2 != 0 && !sprite)
+     {
+         // Try to detect common patterns of flat UI primitives.
+diff --git a/gs/shaders/ubershader.comp b/gs/shaders/ubershader.comp
+index 9d0d3fd..876ef62 100644
+--- a/gs/shaders/ubershader.comp
++++ b/gs/shaders/ubershader.comp
+@@ -945,10 +945,16 @@ vec4 highlight2(vec4 a, vec4 b, bool tcc)
+ 	return ab;
+ }
+ 
+-float texture_clamp(float coord, vec2 region, float LOD)
++float texture_clamp(float coord, vec2 region, float LOD, float hd_scale)
+ {
+ 	vec2 clamp_coords = region;
+ 	clamp_coords = floor(ldexp(clamp_coords, ivec2(-LOD))); // Scale to LOD
++	if (hd_scale > 1.0)
++	{
++		// HD replacement: coordinates stay in original texels, so the first / last HD texel centre is 0.5 / scale inside the edge texel.
++		// Clamping to the original texel centre (+0.5) would repeat the outer HD rows of every edge.
++		return clamp(coord, clamp_coords.x + 0.5 / hd_scale, clamp_coords.y + 1.0 - 0.5 / hd_scale);
++	}
+ 	clamp_coords += 0.5;
+ 	return clamp(coord, clamp_coords.x, clamp_coords.y);
+ }
+@@ -1062,6 +1068,7 @@ vec4 sample_texture(uint tex_word, uint filtering, vec2 uv, float q, bool perspe
+ 	vec4 size = tex_info.sizes;
+ 	vec4 region_coords = tex_info.region;
+ 	vec2 bias = tex_info.bias;
++	vec2 hd_scale = vec2(float((tex_info.flags >> TEX_INFO_HD_SCALE_X_SHIFT) & 255), float((tex_info.flags >> TEX_INFO_HD_SCALE_Y_SHIFT) & 127));
+ 
+ 	// LOD calculation
+ 
+@@ -1147,9 +1154,9 @@ vec4 sample_texture(uint tex_word, uint filtering, vec2 uv, float q, bool perspe
+ #endif
+ 
+ 	if (sampler_clamp_s)
+-		uv_1.x = texture_clamp(uv_1.x, region_coords.xz, LOD_1);
++		uv_1.x = texture_clamp(uv_1.x, region_coords.xz, LOD_1, hd_scale.x);
+ 	if (sampler_clamp_t)
+-		uv_1.y = texture_clamp(uv_1.y, region_coords.yw, LOD_1);
++		uv_1.y = texture_clamp(uv_1.y, region_coords.yw, LOD_1, hd_scale.y);
+ 
+ 	vec4 color_1;
+ 
+@@ -1237,9 +1244,9 @@ vec4 sample_texture(uint tex_word, uint filtering, vec2 uv, float q, bool perspe
+ 		vec2 uv_2 = uv * scale_2;
+ 
+ 		if (sampler_clamp_s)
+-			uv_2.x = texture_clamp(uv_2.x, region_coords.xz, LOD_2);
++			uv_2.x = texture_clamp(uv_2.x, region_coords.xz, LOD_2, hd_scale.x);
+ 		if (sampler_clamp_t)
+-			uv_2.y = texture_clamp(uv_2.y, region_coords.yw, LOD_2);
++			uv_2.y = texture_clamp(uv_2.y, region_coords.yw, LOD_2, hd_scale.y);
+ 
+ 		uv_2 = (floor(uv_2 * 16.0 + UV_EPSILON_PRE_SNAP) + UV_EPSILON_POST_SNAP) * inv_scale_2 * 0.0625;
+ 

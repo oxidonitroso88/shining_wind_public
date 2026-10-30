@@ -1,0 +1,84 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index cf78d34..4fcd0ad 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -4387,6 +4387,12 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
+ 	return static_cast<const uint8_t *>(renderer.begin_host_vram_access()) + offset;
+ }
+ 
++bool GSInterface::debug_read_vram_slice(uint32_t slice, size_t offset, size_t size, void *dst)
++{
++	flush();
++	return renderer.debug_read_gpu_vram(slice, offset, size, dst);
++}
++
+ void GSInterface::flush()
+ {
+ 	flush_pending_transfer(true);
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 7533bcf..af46f6b 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -286,6 +286,8 @@ public:
+ 	void *map_vram_write(size_t offset, size_t size);
+ 	void end_vram_write(size_t offset, size_t size);
+ 	const void *map_vram_read(size_t offset, size_t size);
++	// Debug aid (see GSRenderer::debug_read_gpu_vram): flushes, then reads a super-sample slice of the GPU VRAM.
++	bool debug_read_vram_slice(uint32_t slice, size_t offset, size_t size, void *dst);
+ 
+ 	void flush();
+ 
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index dbe032d..62b5c37 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -1434,6 +1434,34 @@ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &d
+ 	return img;
+ }
+ 
++bool GSRenderer::debug_read_gpu_vram(uint32_t slice, size_t offset, size_t size, void *dst)
++{
++	if (!device || !buffers.gpu || !size)
++		return false;
++	const VkDeviceSize base = VkDeviceSize(vram_size) * slice + offset;
++	if (base + size > buffers.gpu->get_create_info().size)
++		return false;
++
++	Vulkan::BufferCreateInfo info = {};
++	info.size = size;
++	info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++	info.domain = Vulkan::BufferDomain::CachedHost;
++	auto readback = device->create_buffer(info);
++	auto cmd = device->request_command_buffer();
++	cmd->barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
++			VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++	cmd->copy_buffer(*readback, 0, *buffers.gpu, base, size);
++	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++			VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++	device->submit(cmd);
++	device->wait_idle();
++	const void *mapped = device->map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT);
++	if (!mapped)
++		return false;
++	memcpy(dst, mapped, size);
++	return true;
++}
++
+ void GSRenderer::allocate_upload_indirection(TextureAnalysis &analysis, TextureUpload &upload)
+ {
+ 	uint32_t horiz_blocks = (upload.desc.rect.width + 7) / 8;
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index a73e464..74d0018 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -361,6 +361,10 @@ public:
+ 
+ 	Vulkan::Device *get_device() const { return device; }
+ 
++	// Debug aid: copies `size` bytes of GPU VRAM slice `slice` (0 = the normal 4 MiB VRAM, 1 = super-sample marker plane, 2.. = super-sample layers)
++	// starting at byte `offset` of the slice into `dst`. Everything recorded so far must have been flushed. Returns false if out of range.
++	bool debug_read_gpu_vram(uint32_t slice, size_t offset, size_t size, void *dst);
++
+ private:
+ 	PageTracker &tracker;
+ 	Vulkan::Device *device = nullptr;

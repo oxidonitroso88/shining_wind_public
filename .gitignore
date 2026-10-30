@@ -1,0 +1,70 @@
+/bin/
+/intermediate/
+.vs/
+out
+.vscode
+build
+
+*.exe
+*.ilk
+*.exp
+*.log
+*.tlog
+*.ipch
+
+# Now we can place the dump code here and test while expand the Runtime
+ps2xRuntime/include/ps2_recompiled_functions.h
+ps2xRuntime/include/ps2_recompiled_stubs.h
+ps2xRuntime/src/runner/ps2_recompiled_functions.cpp
+ps2xRuntime/src/runner/register_functions.cpp
+ps2xRuntime/output
+ps2xRuntime/src/runner
+ps2xRuntime/src/runner_overlays
+# user resource replacement folder (PS2X_MODS, default ./mods): never versioned
+/mods/
+android/app/.cxx/
+android/local.properties
+android/.gradle/ 
+.idea/
+/output/
+# Archivos locales y temporales de Shining Wind
+/findstr
+/tatus --short
+/imgui.ini
+/ps2_log.txt
+/recomp_log*.txt
+/shining_wind_ghidra.csv
+
+# Datos auxiliares de Ghidra
+/tools/ghidra/audit-source/
+/tools/ghidra/exporter-work/before/classes/
+/tools/ghidra/exporter-work/candidate/classes/
+/tools/ghidra/exporter-work/test-classes/
+/tools/ghidra/extensions/
+/tools/ghidra/external-evidence/
+/tools/ghidra/runs/
+/tools/ghidra/snapshots/
+# virtual memory cards created by the runtime (user save data)
+/memcards/
+
+# parallel-gs checkout (LGPL, fetched by tools/perf/fetch_parallel_gs.ps1)
+third_party/parallel-gs/
+
+# HD texture packs installed next to the port (user content)
+hd_packs/
+third_party_fonts/dejavu/dejavu.zip
+third_party_fonts/dejavu/dejavu-fonts-ttf-2.37/ttf/
+
+tools/texbulk/__pycache__/
+tools/texbulk/tests/__pycache__/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Local dumps, derived/generated and per-machine files (never versioned)
+/ram_*.bin
+/shining_wind_ghidra.csv.bak-*
+/findstr
+/tatus*
+tools/ghidra/exporter-work/*/classes-*/

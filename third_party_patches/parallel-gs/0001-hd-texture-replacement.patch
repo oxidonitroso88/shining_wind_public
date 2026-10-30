@@ -1,0 +1,315 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index ea00016..cf78d34 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1225,6 +1225,106 @@ void GSInterface::forget_in_render_pass_memoization()
+ 	mark_texture_state_dirty();
+ }
+ 
++void GSInterface::set_texture_replacer(TextureReplacer *replacer, uint64_t budget_bytes)
++{
++	texture_replacer = replacer;
++	replacement_budget = budget_bytes;
++	if (!replacer)
++	{
++		replacement_images.clear();
++		replacement_stats.resident_bytes = 0;
++	}
++}
++
++TextureReplacementStats GSInterface::get_texture_replacement_stats() const
++{
++	return replacement_stats;
++}
++
++GSInterface::ReplacementBinding GSInterface::find_replacement_image(const TextureDescriptor &desc, const TEX0Bits &game_tex0, const ivec4 &uv_bb)
++{
++	ReplacementBinding binding;
++	replacement_stats.lookups++;
++	TextureReplacement rep;
++	if (!texture_replacer || !texture_replacer->lookup_replacement(desc, game_tex0, rep))
++		return binding;
++
++	if (rep.scale_x == 0 || rep.scale_y == 0 || rep.orig_width == 0 || rep.orig_height == 0 ||
++	    rep.width != rep.orig_width * rep.scale_x || rep.height != rep.orig_height * rep.scale_y)
++	{
++		replacement_stats.rejected++;
++		return binding;
++	}
++
++	// Only the rectangle the host identified may be replaced. If the sampled window is larger than that rectangle (e.g. a 512x32 texture of which only
++	// 336x24 texels were uploaded), the draw must stay inside the rectangle, otherwise the original texture is used.
++	const TexRect &r = desc.rect;
++	const bool window_inside = r.x >= rep.origin_x && r.y >= rep.origin_y &&
++	                           r.x + r.width <= rep.origin_x + rep.orig_width && r.y + r.height <= rep.origin_y + rep.orig_height;
++	const bool draw_inside = uv_bb.x >= int(rep.origin_x) && uv_bb.y >= int(rep.origin_y) &&
++	                         uv_bb.z < int(rep.origin_x + rep.orig_width) && uv_bb.w < int(rep.origin_y + rep.orig_height);
++	if (!window_inside && !draw_inside)
++	{
++		replacement_stats.rejected++;
++		return binding;
++	}
++
++	// The image is the whole replacement (shared by every window of the texture); the key identifies it.
++	const uint64_t key = rep.key;
++	replacement_clock++;
++	auto itr = replacement_images.find(key);
++	if (itr == replacement_images.end())
++	{
++		const uint8_t *pixels = rep.rgba ? rep.rgba : texture_replacer->replacement_pixels(rep.key);
++		if (!pixels)
++		{
++			replacement_stats.rejected++;
++			return binding;
++		}
++
++		Vulkan::ImageCreateInfo info = Vulkan::ImageCreateInfo::immutable_2d_image(rep.width, rep.height, VK_FORMAT_R8G8B8A8_UNORM);
++		Vulkan::ImageInitialData initial = { pixels, rep.width, rep.height };
++		auto image = renderer.get_device()->create_image(info, &initial);
++		if (!image)
++		{
++			replacement_stats.rejected++;
++			return binding;
++		}
++
++		ReplacementImage entry;
++		entry.image = std::move(image);
++		entry.bytes = uint64_t(rep.width) * rep.height * 4;
++		replacement_stats.images_created++;
++		replacement_stats.resident_bytes += entry.bytes;
++		itr = replacement_images.emplace(key, std::move(entry)).first;
++
++		// Keep the cache inside its budget: drop the least recently used entries (in flight references keep the image alive).
++		while (replacement_budget && replacement_stats.resident_bytes > replacement_budget && replacement_images.size() > 1)
++		{
++			auto victim = replacement_images.end();
++			for (auto it = replacement_images.begin(); it != replacement_images.end(); ++it)
++				if (it->first != key && (victim == replacement_images.end() || it->second.last_use < victim->second.last_use))
++					victim = it;
++			if (victim == replacement_images.end())
++				break;
++			replacement_stats.resident_bytes -= victim->second.bytes;
++			replacement_stats.images_evicted++;
++			replacement_images.erase(victim);
++		}
++		itr = replacement_images.find(key);
++	}
++
++	itr->second.last_use = replacement_clock;
++	replacement_stats.hits++;
++	binding.image = itr->second.image;
++	binding.linear = rep.linear;
++	binding.origin_x = rep.origin_x;
++	binding.origin_y = rep.origin_y;
++	binding.width = rep.orig_width;
++	binding.height = rep.orig_height;
++	return binding;
++}
++
+ void GSInterface::recycle_image_handle(Vulkan::ImageHandle image)
+ {
+ 	// If we're debugging we don't want the confusion of aliased image handles.
+@@ -1759,16 +1859,33 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 				state_tracker.texflush_counter, long_term_cache_texture);
+ 		}
+ 
++		// HD replacement: the image bound to the shader changes, every coordinate stays in original texel space.
++		// The window (desc.rect) of the original texture is what the replacement image covers, so it defines the normalisation.
++		ReplacementBinding replacement_binding;
++		bool replacement_linear = false;
++		if (texture_replacer && desc.samples == 1 && desc.rect.levels == 1 && !render_pass.is_potential_feedback)
++			replacement_binding = find_replacement_image(desc, ctx.tex0.desc, uv_bb);
++
++		Vulkan::ImageHandle replacement = std::move(replacement_binding.image);
++		replacement_linear = replacement_binding.linear;
++
+ 		TextureInfo info = {};
+-		info.view = &image->get_view();
++		info.view = replacement ? &replacement->get_view() : &image->get_view();
++		const uint32_t ref_width = replacement ? desc.rect.width : info.view->get_view_width();
++		const uint32_t ref_height = replacement ? desc.rect.height : info.view->get_view_height();
++		// Normalised coordinates: the replacement image spans the replaced rectangle of the original texture (texel units stay original).
++		const uint32_t norm_width = replacement ? replacement_binding.width : ref_width;
++		const uint32_t norm_height = replacement ? replacement_binding.height : ref_height;
++		const uint32_t norm_x = replacement ? replacement_binding.origin_x : desc.rect.x;
++		const uint32_t norm_y = replacement ? replacement_binding.origin_y : desc.rect.y;
+ 		info.info.sizes = vec4(float(width), float(height),
+-							   1.0f / float(info.view->get_view_width()),
+-							   1.0f / float(info.view->get_view_height()));
++							   1.0f / float(norm_width),
++							   1.0f / float(norm_height));
+ 
+ 		if (uint32_t(desc.clamp.desc.WMS) == CLAMPBits::CLAMP)
+ 		{
+ 			info.info.region.x = 0.0f;
+-			info.info.region.z = float(info.view->get_view_width()) - 1.0f;
++			info.info.region.z = float(ref_width) - 1.0f;
+ 		}
+ 		else if (uint32_t(desc.clamp.desc.WMS) == CLAMPBits::REGION_CLAMP)
+ 		{
+@@ -1779,7 +1896,7 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		if (uint32_t(desc.clamp.desc.WMT) == CLAMPBits::CLAMP)
+ 		{
+ 			info.info.region.y = 0.0f;
+-			info.info.region.w = float(info.view->get_view_height()) - 1.0f;
++			info.info.region.w = float(ref_height) - 1.0f;
+ 		}
+ 		else if (uint32_t(desc.clamp.desc.WMT) == CLAMPBits::REGION_CLAMP)
+ 		{
+@@ -1787,11 +1904,13 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 			info.info.region.w = float(uint32_t(desc.clamp.desc.MAXV));
+ 		}
+ 
+-		info.info.bias.x = -float(desc.rect.x) * info.info.sizes.z;
+-		info.info.bias.y = -float(desc.rect.y) * info.info.sizes.w;
++		info.info.bias.x = -float(norm_x) * info.info.sizes.z;
++		info.info.bias.y = -float(norm_y) * info.info.sizes.w;
+ 
+ 		info.info.arrayed = int(desc.samples > 1);
+ 		info.info.flags = long_term_cache_texture ? TEX_INFO_LONG_TERM_REFERENCE : 0;
++		if (replacement)
++			info.info.flags |= TEX_INFO_HD_REPLACEMENT | (replacement_linear ? TEX_INFO_HD_REPLACEMENT_LINEAR : 0);
+ 		if (info.info.arrayed)
+ 			render_pass.tex_infos_has_super_samples = true;
+ 
+@@ -1802,6 +1921,8 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		render_pass.tex_infos.push_back(info);
+ 		render_pass.tex0_infos.push_back(ctx.tex0.desc);
+ 		render_pass.held_images.push_back(std::move(image));
++		if (replacement)
++			render_pass.held_images.push_back(std::move(replacement));
+ 	}
+ 
+ 	state_tracker.last_texture_descriptor = desc;
+@@ -1833,6 +1954,8 @@ void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const
+ 		if (tex_index < MaxTextures)
+ 		{
+ 			auto &info = render_pass.tex_infos[tex_index].info;
++			if ((info.flags & TEX_INFO_HD_REPLACEMENT_LINEAR) != 0)
++				p.tex |= TEX_SAMPLER_MAG_LINEAR_BIT;
+ 			if (info.arrayed)
+ 			{
+ 				p.tex |= TEX_PER_SAMPLE_BIT;
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 9f05da8..7533bcf 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -13,6 +13,7 @@
+ #include "dynamic_array.hpp"
+ #include <stddef.h>
+ #include <vector>
++#include <unordered_map>
+ #include <type_traits>
+ 
+ namespace ParallelGS
+@@ -259,6 +260,10 @@ public:
+ 	void set_debug_mode(const DebugMode &mode);
+ 	void set_hacks(const Hacks &hacks);
+ 
++	// Optional HD texture replacement (see TextureReplacer). `budget_bytes` bounds the GPU memory of cached replacement images.
++	void set_texture_replacer(TextureReplacer *replacer, uint64_t budget_bytes = 512ull << 20);
++	TextureReplacementStats get_texture_replacement_stats() const;
++
+ 	// Optional interface if application wants to listen for these IRQ related events.
+ 	void set_signal_interface(SignalInterface *iface);
+ 
+@@ -618,6 +623,28 @@ private:
+ 	uint32_t sampling_rate_y_log2 = 0;
+ 	bool super_sampled_textures = false;
+ 
++	// HD texture replacement.
++	struct ReplacementImage
++	{
++		Vulkan::ImageHandle image;
++		uint64_t bytes = 0;
++		uint64_t last_use = 0;
++		bool linear = true;
++	};
++	TextureReplacer *texture_replacer = nullptr;
++	uint64_t replacement_budget = 0;
++	uint64_t replacement_clock = 0;
++	TextureReplacementStats replacement_stats;
++	std::unordered_map<uint64_t, ReplacementImage> replacement_images;
++	struct ReplacementBinding
++	{
++		Vulkan::ImageHandle image; // null: use the original texture
++		bool linear = false;
++		uint32_t origin_x = 0, origin_y = 0; // replaced rectangle in original texture space
++		uint32_t width = 0, height = 0;
++	};
++	ReplacementBinding find_replacement_image(const TextureDescriptor &desc, const TEX0Bits &game_tex0, const ivec4 &uv_bb);
++
+ 	void reset_context_state_registers();
+ 
+ 	enum { MaxPromotedBackbuffers = 4 };
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index d9acc50..a73e464 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -118,6 +118,43 @@ struct TextureDescriptor
+ 	}
+ };
+ 
++// Optional host-provided replacement of a game texture by a higher resolution image (HD texture packs).
++// The host decides *which* texture it is (identity) from the TextureDescriptor; parallel-gs only substitutes the image that is sampled.
++// VRAM, the original texture upload and every UV / clamp / region coordinate stay in the original texel space: the replacement covers the
++// same rectangle of the original texture with `scale_x` x `scale_y` texels per original texel.
++struct TextureReplacement
++{
++	uint64_t key = 0;               // host-defined identity of the replacement image; equal keys must mean equal pixels
++	const uint8_t *rgba = nullptr;  // optional: RGBA8, top-left origin, width * height * 4 bytes, alpha already in GS range (0x80 = opaque); when null,
++	                                // replacement_pixels(key) is asked for it, and only if the image is not cached yet
++	uint32_t width = 0, height = 0; // replacement size in texels
++	uint32_t scale_x = 1, scale_y = 1; // replacement texels per original texel (integers)
++	uint32_t origin_x = 0, origin_y = 0; // top-left of the replaced rectangle in original texture space
++	uint32_t orig_width = 0, orig_height = 0; // size of the replaced rectangle in original texels (width == orig_width * scale_x)
++	bool linear = true;             // sample the replacement with bilinear filtering instead of the game's filter
++};
++
++class TextureReplacer
++{
++public:
++	virtual ~TextureReplacer() = default;
++	// Called when a texture is bound to a render pass (not per draw). Return true and fill `out` to substitute the image.
++	// `game_tex0` is the TEX0 register as the game wrote it (the descriptor normalises palette fields such as CBP away).
++	virtual bool lookup_replacement(const TextureDescriptor &desc, const TEX0Bits &game_tex0, TextureReplacement &out) = 0;
++	// The pixels of a replacement image (same layout as TextureReplacement::rgba), valid until the next call. Null when they cannot be produced.
++	virtual const uint8_t *replacement_pixels(uint64_t key) { (void)key; return nullptr; }
++};
++
++struct TextureReplacementStats
++{
++	uint64_t lookups = 0;       // descriptors offered to the replacer
++	uint64_t hits = 0;          // replacements bound
++	uint64_t rejected = 0;      // replacer said yes but the window does not fit / the image could not be created
++	uint64_t images_created = 0;
++	uint64_t images_evicted = 0;
++	uint64_t resident_bytes = 0;
++};
++
+ struct PaletteUploadDescriptor
+ {
+ 	Reg64<TEX0Bits> tex0;
+@@ -322,6 +359,8 @@ public:
+ 
+ 	void set_field_aware_super_sampling(bool enable);
+ 
++	Vulkan::Device *get_device() const { return device; }
++
+ private:
+ 	PageTracker &tracker;
+ 	Vulkan::Device *device = nullptr;
+diff --git a/gs/shaders/data_structures.h b/gs/shaders/data_structures.h
+index 62882ab..439aaa4 100644
+--- a/gs/shaders/data_structures.h
++++ b/gs/shaders/data_structures.h
+@@ -106,6 +106,9 @@ struct TexInfo
+ 
+ CONSTEXPR int TEX_INFO_FORCE_SAMPLE_MAPPING = 0x1;
+ CONSTEXPR int TEX_INFO_LONG_TERM_REFERENCE = 0x2;
++// Host side only (never read by the shaders): the bound image is a host provided HD replacement (see TextureReplacer).
++CONSTEXPR int TEX_INFO_HD_REPLACEMENT = 0x100;
++CONSTEXPR int TEX_INFO_HD_REPLACEMENT_LINEAR = 0x200;
+ 
+ CONSTEXPR int PGS_FB_SWIZZLE_WIDTH_LOG2 = 3;
+ CONSTEXPR int PGS_FB_SWIZZLE_HEIGHT_LOG2 = 3;

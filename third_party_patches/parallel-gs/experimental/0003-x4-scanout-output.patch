@@ -1,0 +1,296 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 4fcd0ad..1e8b342 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -2823,6 +2823,15 @@ void GSInterface::drawing_kick_append()
+ 		prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
+ 		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
+ 		prim_attr.state &= ~(1u << STATE_BIT_MULTISAMPLE);
++
++		// X4 PATCH: a sprite that samples an HD replacement keeps its snapped coverage but gets per-sample attribute interpolation.
++		if (hacks.hd_per_sample_sprites && sampling_rate_y_log2)
++		{
++			const uint32_t hd_tex_index = (uint32_t(prim_attr.tex) >> TEX_TEXTURE_INDEX_OFFSET) & ((1u << TEX_TEXTURE_INDEX_BITS) - 1u);
++			if (hd_tex_index < MaxTextures && hd_tex_index < render_pass.tex_infos.size() &&
++			    (render_pass.tex_infos[hd_tex_index].info.flags & TEX_INFO_HD_REPLACEMENT) != 0)
++				prim_attr.state &= ~(1u << STATE_BIT_SNAP_ATTRIBUTE);
++		}
+ 	}
+ 	else if (is_line)
+ 	{
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index af46f6b..819ec35 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -153,6 +153,11 @@ struct DebugMode
+ 	DrawDebugMode draw_mode = DrawDebugMode::None;
+ };
+ 
++// Defined by the X4 patch: VSyncInfo::high_resolution_scanout_log2 exists.
++#define PARALLEL_GS_SCANOUT_LOG2 1
++// Defined by the X4 patch: Hacks::hd_per_sample_sprites exists.
++#define PARALLEL_GS_HD_PER_SAMPLE 1
++
+ struct VSyncInfo
+ {
+ 	uint32_t phase;
+@@ -193,6 +198,11 @@ struct VSyncInfo
+ 	// For best results, force_progressive must also be used.
+ 	bool high_resolution_scanout;
+ 
++	// X4 PATCH (experimental): log2 of the high resolution scanout factor over the single-sampled picture.
++	// 1 (default) = the original 2x2 output pixels per game pixel; 2 = 4x4 output pixels, one super-sample each (requires 16x SSAA,
++	// otherwise the request falls back to 1). Ignored unless high_resolution_scanout is in effect.
++	uint32_t high_resolution_scanout_log2 = 1;
++
+ 	// If using interlaced, defer any attempt to deinterlace and just return the raw output as-is with phase information.
+ 	// User is responsible for deinterlacing in whatever way is appropriate.
+ 	bool skip_deinterlace;
+@@ -211,6 +221,11 @@ struct GSOptions
+ // Not accurate. Use at your own risk.
+ struct Hacks
+ {
++	// X4 PATCH (experimental): sprites (2D primitives) that sample a host provided HD replacement texture interpolate their texture coordinates per
++	// SAMPLE instead of once per pixel (the default for sprites is MSAA-like: coverage is super-sampled, attributes are snapped to the single-rate pixel).
++	// Without this the extra samples of a super-sampled scanout carry no extra texture detail for HD replacements. Only affects replaced textures.
++	bool hd_per_sample_sprites = false;
++
+ 	// Forces LOD0 to be read. Can break games which don't populate LOD0 with meaningful data.
+ 	// Can be useful when up-scaling to retain more texture detail.
+ 	bool disable_mipmaps = false;
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 62b5c37..5952ab3 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4156,7 +4156,7 @@ void GSRenderer::transfer_overlap_barrier()
+ 
+ void GSRenderer::sample_crtc_circuit(Vulkan::CommandBuffer &cmd, const Vulkan::Image &img, const DISPFBBits &dispfb,
+                                      const SamplingRect &rect, uint32_t super_samples,
+-                                     const Vulkan::Image *promoted)
++                                     const Vulkan::Image *promoted, uint32_t scanout_shift)
+ {
+ 	cmd.image_barrier(img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+ 	                  0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+@@ -4179,15 +4179,16 @@ void GSRenderer::sample_crtc_circuit(Vulkan::CommandBuffer &cmd, const Vulkan::I
+ 	auto valid_extent = rect.valid_extent;
+ 	if (super_samples > 1)
+ 	{
+-		valid_extent.width *= 2;
+-		valid_extent.height *= 2;
++		valid_extent.width <<= scanout_shift;
++		valid_extent.height <<= scanout_shift;
+ 	}
+ 	cmd.set_scissor({{ 0, 0 }, valid_extent });
+ 
+-	cmd.set_specialization_constant_mask(0x7);
++	cmd.set_specialization_constant_mask(0xf);
+ 	cmd.set_specialization_constant(0, uint32_t(dispfb.PSM));
+ 	cmd.set_specialization_constant(1, vram_size - 1);
+ 	cmd.set_specialization_constant(2, super_samples);
++	cmd.set_specialization_constant(3, scanout_shift);
+ 
+ 	struct Registers
+ 	{
+@@ -4347,6 +4348,12 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 	if (high_resolution_scanout)
+ 		super_samples = 1 << (sampling_rate_x_log2 + sampling_rate_y_log2);
+ 
++	// X4 PATCH: log2 of the scanout factor. 1 = original behaviour; 2 only with the 4x4 ordered sample grid (X16).
++	uint32_t scanout_shift = 1;
++	if (high_resolution_scanout && info.high_resolution_scanout_log2 == 2 &&
++	    sampling_rate_x_log2 == 2 && sampling_rate_y_log2 == 2)
++		scanout_shift = 2;
++
+ 	if (promoted1 && promoted1->get_create_info().layers < super_samples)
+ 		promoted1 = nullptr;
+ 	if (promoted2 && promoted2->get_create_info().layers < super_samples)
+@@ -4673,11 +4680,11 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		{
+ 			if (high_resolution_scanout)
+ 			{
+-				image_info.width *= 2;
+-				image_info.height *= 2;
++				image_info.width <<= scanout_shift;
++				image_info.height <<= scanout_shift;
+ 			}
+ 			circuit1 = device->create_image(image_info);
+-			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, promoted1);
++			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, promoted1, scanout_shift);
+ 			device->set_name(*circuit1, "Circuit1");
+ 		}
+ 
+@@ -4731,11 +4738,11 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		{
+ 			if (high_resolution_scanout)
+ 			{
+-				image_info.width *= 2;
+-				image_info.height *= 2;
++				image_info.width <<= scanout_shift;
++				image_info.height <<= scanout_shift;
+ 			}
+ 			circuit2 = device->create_image(image_info);
+-			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, promoted2);
++			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, promoted2, scanout_shift);
+ 			device->set_name(*circuit2, "Circuit2");
+ 		}
+ 
+@@ -4793,8 +4800,8 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		// Need to do all the CRTC offset math in single sampled domain to avoid lots of confusing cases later.
+ 		if (high_resolution_scanout)
+ 		{
+-			horiz_resolution0 >>= 1;
+-			horiz_resolution1 >>= 1;
++			horiz_resolution0 >>= scanout_shift;
++			horiz_resolution1 >>= scanout_shift;
+ 		}
+ 
+ 		uint32_t magh1 = priv.display1.MAGH + 1;
+@@ -4841,8 +4848,8 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 
+ 		if (high_resolution_scanout)
+ 		{
+-			effective_mode_width *= 2;
+-			effective_mode_height *= 2;
++			effective_mode_width <<= scanout_shift;
++			effective_mode_height <<= scanout_shift;
+ 		}
+ 
+ 		bool is_raw_circuit1 =
+@@ -4865,8 +4872,8 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 			                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+ 			                  info.dst_stage, info.dst_access);
+ 
+-			result.internal_width = result.image->get_width() >> int(high_resolution_scanout);
+-			result.internal_height = result.image->get_height() >> int(high_resolution_scanout);
++			result.internal_width = result.image->get_width() >> (high_resolution_scanout ? scanout_shift : 0);
++			result.internal_height = result.image->get_height() >> (high_resolution_scanout ? scanout_shift : 0);
+ 			result.double_strike = double_strike;
+ 
+ 			flush_submit(0);
+@@ -4876,13 +4883,15 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 
+ 	result.internal_width = mode_width;
+ 	result.internal_height = mode_height;
+-	image_info.width = mode_width << int(high_resolution_scanout);
+-	image_info.height = mode_height << int(high_resolution_scanout);
++	image_info.width = mode_width << (high_resolution_scanout ? scanout_shift : 0);
++	image_info.height = mode_height << (high_resolution_scanout ? scanout_shift : 0);
+ 
++	// Rows of output per half game line (1 at 2x, 2 at 4x): the two fields are offset by that many rows.
++	const uint32_t field_row_offset = (1u << scanout_shift) >> 1;
+ 	if (field_aware_rendering)
+ 	{
+ 		// Avoid a one line flicker due to field rendering.
+-		image_info.height--;
++		image_info.height -= field_row_offset;
+ 	}
+ 
+ 	auto merged = device->create_image(image_info);
+@@ -4948,13 +4957,14 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 
+ 			if (high_resolution_scanout)
+ 			{
+-				vp.x *= 2.0f;
+-				vp.y *= 2.0f;
+-				vp.width *= 2.0f;
+-				vp.height *= 2.0f;
++				const float scanout_scale = float(1u << scanout_shift);
++				vp.x *= scanout_scale;
++				vp.y *= scanout_scale;
++				vp.width *= scanout_scale;
++				vp.height *= scanout_scale;
+ 
+ 				if (field_aware_rendering && !info.phase)
+-					vp.y -= 1.0f;
++					vp.y -= float(field_row_offset);
+ 			}
+ 
+ 			cmd.set_viewport(vp);
+@@ -4981,13 +4991,14 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 
+ 			if (high_resolution_scanout)
+ 			{
+-				vp.x *= 2.0f;
+-				vp.y *= 2.0f;
+-				vp.width *= 2.0f;
+-				vp.height *= 2.0f;
++				const float scanout_scale = float(1u << scanout_shift);
++				vp.x *= scanout_scale;
++				vp.y *= scanout_scale;
++				vp.width *= scanout_scale;
++				vp.height *= scanout_scale;
+ 
+ 				if (field_aware_rendering && !info.phase)
+-					vp.y -= 1.0f;
++					vp.y -= float(field_row_offset);
+ 			}
+ 
+ 			cmd.set_viewport(vp);
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index 74d0018..59fa971 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -541,7 +541,7 @@ private:
+ 
+ 	void sample_crtc_circuit(Vulkan::CommandBuffer &cmd, const Vulkan::Image &img,
+ 	                         const DISPFBBits &dispfb, const SamplingRect &rect, uint32_t super_samples,
+-	                         const Vulkan::Image *promoted);
++	                         const Vulkan::Image *promoted, uint32_t scanout_shift);
+ 
+ 	static SamplingRect compute_circuit_rect(const PrivRegisterState &priv, uint32_t phase,
+ 	                                         const DISPLAYBits &display, bool force_progressive,
+diff --git a/gs/shaders/sample_circuit.frag b/gs/shaders/sample_circuit.frag
+index f8acb20..0f507f8 100644
+--- a/gs/shaders/sample_circuit.frag
++++ b/gs/shaders/sample_circuit.frag
+@@ -40,6 +40,8 @@ layout(push_constant) uniform Registers
+ layout(constant_id = 0) const int PSM = 0;
+ layout(constant_id = 1) const uint VRAM_MASK = 4 * 1024 * 1024 - 1;
+ layout(constant_id = 2) const uint SUPER_SAMPLES = 1;
++// log2 of the scanout factor over the single-sampled picture: 1 = 2x2 output pixels per game pixel (the original behaviour), 2 = 4x4 (needs 16 samples).
++layout(constant_id = 3) const uint SCANOUT_SHIFT = 1;
+ 
+ const bool is_tex_16bit = PSM == PSMCT16 || PSM == PSMCT16S || PSM == PSMZ16 || PSM == PSMZ16S;
+ 
+@@ -100,7 +102,7 @@ void main()
+     uvec2 super_sampled_coord = uvec2(gl_FragCoord.xy);
+     uvec2 single_sampled_coord;
+     if (SUPER_SAMPLES >= 4)
+-        single_sampled_coord = super_sampled_coord >> 1;
++        single_sampled_coord = super_sampled_coord >> SCANOUT_SHIFT;
+     else
+         single_sampled_coord = super_sampled_coord;
+ 
+@@ -129,6 +131,16 @@ void main()
+ 
+             const uint NUM_SSAA_SAMPLES = SUPER_SAMPLES / 4;
+ 
++            if (SUPER_SAMPLES == 16 && SCANOUT_SHIFT == 2)
++            {
++                // One output pixel per sample: the sample grid of a game pixel is 4x4 (ordered grid, see compute_sample_points()):
++                // sample id = (y & 1) | ((x & 1) << 1) | ((y >> 1) << 2) | ((x >> 1) << 3).
++                uvec2 sub = super_sampled_coord & 3u;
++                uint sample_id = (sub.y & 1u) | ((sub.x & 1u) << 1u) | ((sub.y >> 1u) << 2u) | ((sub.x >> 1u) << 3u);
++                FragColor = sample_vram(addr, BASE_SSAA_LAYER + sample_id);
++                return;
++            }
++
+             // The swizzling pattern for checkerboard is a bit different.
+             if (SUPER_SAMPLES != 8)
+                 quad_offset = (super_sampled_coord.y & 1u) + (super_sampled_coord.x & 1u) * 2u;
+diff --git a/gs/shaders/ubershader.comp b/gs/shaders/ubershader.comp
+index 33be934..9d0d3fd 100644
+--- a/gs/shaders/ubershader.comp
++++ b/gs/shaders/ubershader.comp
+@@ -887,9 +887,10 @@ ShadeResultEarly shade_early(uint primitive_index)
+ 			i = bary.x;
+ 			j = bary.y;
+ 		}
+-		else if (HAS_TEXTURE_ARRAY && snap_state == SNAP_RASTER_BIT)
++		else if (snap_state == SNAP_RASTER_BIT)
+ 		{
+ 			// For SSAA textured sprites, we may snap coverage, but we want per-sample interpolation.
++			// (X4 PATCH: no longer tied to super-sampled textures: the host also uses this state for sprites that sample an HD replacement.)
+ 			vec2 bary = evaluate_barycentric_ij(prim.b, prim.c, prim.inv_area,
+ 				prim.error_i, prim.error_j, tile.fb_pixel, SAMPLING_RATE_DIM_LOG2);
+ 			i = bary.x;
