@@ -68,3 +68,8 @@ __pycache__/
 /findstr
 /tatus*
 tools/ghidra/exporter-work/*/classes-*/
+
+# make_port.py output: the game files extracted from the user disc, generated sources, build trees and the finished package. Never commit these.
+/port-work/
+/ShiningWind-port/
+/third_party/
