@@ -83,6 +83,8 @@ La traducción al inglés y los paquetes de texturas HD **no** están en este re
 ```
 Se cargan al arrancar el juego. Los paquetes HD necesitan `play-x4.cmd`.
 
+Guía detallada (qué archivos son, subcarpetas, cómo comprobarlo y qué hacer si falla): [MODS.es.md](MODS.es.md) / [MODS.en.md](MODS.en.md).
+
 ## 9. Si algo falla
 | Mensaje o síntoma | Qué hacer |
 |---|---|
