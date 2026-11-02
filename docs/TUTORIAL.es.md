@@ -70,6 +70,10 @@ ShiningWind.exe --disc "C:\Games\Shining Wind.iso" --data-dir "D:\ShiningWindDat
 ```
 Las partidas (memory card virtual) van a `<carpeta de datos>\memcards` y un registro corto de errores a `<carpeta de datos>\logs\ShiningWind.log`.
 
+## 6b. Launcher (elegir la resolución)
+
+Doble clic en **`Launcher.cmd`** (usa el Python con el que compilaste): elegís la resolución (**x1** original, **x2** mejorada, **x4** HD), la carpeta de datos, si querés jugar sin mods, y pulsás **Jugar**. Muestra qué traducción y paquetes HD tenés instalados, y el botón **Cómo instalar mods…** abre la guía [MODS.es.md](MODS.es.md). Recuerda tu última elección en `%APPDATA%\ShiningWind\launcher.json`. Solo establece las mismas variables de entorno que `play-x4.cmd` y arranca `ShiningWind.exe`; no cambia nada más. Los paquetes HD solo se ven en x4, y x4 exige una GPU potente (en una GPU integrada puede ir por debajo de la velocidad real).
+
 ## 7. Jugar en HD (×4)
 Usá **`play-x4.cmd`** en lugar de `ShiningWind.exe`: arranca el mismo programa con resolución interna ×4, que necesitan los paquetes de texturas HD.
 

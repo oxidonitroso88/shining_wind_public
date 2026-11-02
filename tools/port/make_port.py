@@ -363,6 +363,12 @@ def stage_package(c):
     (c.dist / "play-x4.cmd").write_text(
         "@echo off\r\nrem x4 internal resolution (needed by the HD texture packs)\r\nset PS2X_GS_SCALE=4\r\nset PS2X_GS_OUTPUT=4\r\nset PS2X_GS_PROMOTE=1\r\n"
         "set PS2X_GS_HD_SSAA=1\r\nset PS2X_GS_GPU_DOWNSCALE=1\r\nstart \"\" \"%~dp0ShiningWind.exe\" %*\r\n", encoding="ascii")
+    lau = ROOT / "tools" / "launcher" / "launcher.pyw"
+    if lau.exists():  # resolution picker + mods status + link to the mods guide (needs the Python used for this build)
+        shutil.copyfile(lau, c.dist / "launcher.pyw")
+        (c.dist / "Launcher.cmd").write_text(
+            "@echo off\r\nwhere pyw >nul 2>nul && (start \"\" pyw \"%~dp0launcher.pyw\") || (start \"\" pythonw \"%~dp0launcher.pyw\")\r\n",
+            encoding="ascii")
     print("  %s ready" % c.dist)
 
 
