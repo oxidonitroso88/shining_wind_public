@@ -4,7 +4,7 @@
 Double-click Launcher.cmd (or this file) next to ShiningWind.exe. It only sets the same environment variables that play-x4.cmd sets and starts ShiningWind.exe;
 nothing is written next to the game except %APPDATA%\\ShiningWind\\launcher.json (remembered choices). Needs the Python that was used to build the port (tkinter ships with it).
 
-  launcher.pyw --selftest [--res 1|2|4] [--no-mods] [--unlock] [--fastbuf]   prints the command and environment that would be used, starts nothing (no window)
+  launcher.pyw --selftest [--res 1|2|4] [--no-mods] [--unlock|--no-unlock] [--fastbuf]   prints the command and environment that would be used, starts nothing (no window)
 """
 import json
 import os
@@ -28,6 +28,8 @@ RESOLUTIONS = {
         "Cuatro veces la resolucion interna. Exige una GPU potente; en una GPU integrada puede ir por debajo de la velocidad real."),
 }
 UNLOCK = {"PS2X_GS_PRESENT_UNLOCK": "1"}
+# Profiles that enable the unlocked present by default (validated with the Vulkan sync layer on the RTX: 0 hazards in 200 s and 600 s; +40 points on a Vega 7 at x2).
+UNLOCK_DEFAULT_RES = (3,)
 FASTBUF = {"PS2X_IPU_FASTBUF": "1"}
 
 
@@ -67,12 +69,14 @@ def mods_status(data_dir):
     return n_st, story, packs
 
 
-def build_launch(exe, res, data_dir, mods_off=False, unlock=False, fastbuf=False):
+def build_launch(exe, res, data_dir, mods_off=False, unlock=None, fastbuf=False):
     """Command line and environment (a copy of os.environ with the chosen variables) for the game."""
     env = dict(os.environ)
     for k in ("PS2X_GS_SCALE", "PS2X_GS_OUTPUT", "PS2X_GS_PROMOTE", "PS2X_GS_HD_SSAA", "PS2X_GS_GPU_DOWNSCALE", "PS2X_GS_PRESENT_UNLOCK", "PS2X_IPU_FASTBUF", "PS2X_MODS", "PS2X_STORY_EN"):
         env.pop(k, None)  # no leftovers from the user's own shell
     env.update(RESOLUTIONS[res][1])
+    if unlock is None:
+        unlock = res in UNLOCK_DEFAULT_RES  # not chosen explicitly: the profile decides
     if unlock:
         env.update(UNLOCK)
     if fastbuf:
@@ -91,7 +95,7 @@ def selftest(argv):
     if "--res" in argv:
         res = int(argv[argv.index("--res") + 1])
     exe = Path(__file__).resolve().parent / EXE_NAME
-    cmd, env = build_launch(exe, res, default_data_dir(), "--no-mods" in argv, "--unlock" in argv, "--fastbuf" in argv)
+    cmd, env = build_launch(exe, res, default_data_dir(), "--no-mods" in argv, True if "--unlock" in argv else (False if "--no-unlock" in argv else None), "--fastbuf" in argv)
     print("command:", cmd)
     for k in sorted(env):
         if k.startswith("PS2X_"):
@@ -136,10 +140,10 @@ def run_gui():
     ttk.Button(frm, text="Elegir...", command=browse).grid(row=7, column=1, padx=(6, 0))
 
     mods_off = tk.BooleanVar(value=bool(cfg.get("mods_off", False)))
-    unlock = tk.BooleanVar(value=bool(cfg.get("unlock", False)))
+    unlock = tk.BooleanVar(value=bool(cfg["unlock"]) if "unlock" in cfg else res_var.get() in UNLOCK_DEFAULT_RES)
     fastbuf = tk.BooleanVar(value=bool(cfg.get("fastbuf", False)))
     ttk.Checkbutton(frm, text="Jugar sin mods (juego original en japones)", variable=mods_off).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
-    ttk.Checkbutton(frm, text="Presentacion sin bloqueo (EXPERIMENTAL: puede mejorar x2/x4 en GPUs lentas)", variable=unlock).grid(row=9, column=0, columnspan=2, sticky="w")
+    ttk.Checkbutton(frm, text="Presentacion sin bloqueo (activada en HD ligero; mejora x2/x4 en GPUs lentas)", variable=unlock).grid(row=9, column=0, columnspan=2, sticky="w")
     ttk.Checkbutton(frm, text="Cola de video rapida (EXPERIMENTAL: menos CPU en los videos)", variable=fastbuf).grid(row=10, column=0, columnspan=2, sticky="w")
 
     status = tk.StringVar()
@@ -185,7 +189,7 @@ def run_gui():
     ttk.Button(btn, text="Carpeta HD", command=lambda: open_dir("hd_packs")).grid(row=0, column=3, padx=6)
     ttk.Button(btn, text="Salir", command=root.destroy).grid(row=0, column=4, padx=(6, 0))
 
-    res_var.trace_add("write", lambda *_: refresh())
+    res_var.trace_add("write", lambda *_: (unlock.set(res_var.get() in UNLOCK_DEFAULT_RES), refresh()))
     root.mainloop()
     return 0
 
