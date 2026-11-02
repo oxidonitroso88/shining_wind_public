@@ -4,7 +4,7 @@
 Double-click Launcher.cmd (or this file) next to ShiningWind.exe. It only sets the same environment variables that play-x4.cmd sets and starts ShiningWind.exe;
 nothing is written next to the game except %APPDATA%\\ShiningWind\\launcher.json (remembered choices). Needs the Python that was used to build the port (tkinter ships with it).
 
-  launcher.pyw --selftest [--res 1|2|4] [--no-mods] [--unlock]   prints the command and environment that would be used, starts nothing (no window)
+  launcher.pyw --selftest [--res 1|2|4] [--no-mods] [--unlock] [--fastbuf]   prints the command and environment that would be used, starts nothing (no window)
 """
 import json
 import os
@@ -20,11 +20,15 @@ EXE_NAME = "ShiningWind.exe"
 RESOLUTIONS = {
     1: ("Original (x1) - 640x448", {}, "La resolucion del PS2. La mas ligera: cualquier PC con Vulkan."),
     2: ("Mejorada (x2)", {"PS2X_GS_SCALE": "2", "PS2X_GS_OUTPUT": "2"}, "Doble resolucion interna. Recomendada para PCs con GPU integrada."),
+    3: ("HD ligero (x2 + texturas HD) - recomendado con paquetes HD",
+        {"PS2X_GS_SCALE": "2", "PS2X_GS_OUTPUT": "2", "PS2X_GS_PROMOTE": "1", "PS2X_GS_GPU_DOWNSCALE": "1"},
+        "Resolucion x2 con los paquetes HD activos. Mismo resultado visual que x4 en una ventana de 1280x896, con mucha menos carga de GPU (probado en una GPU integrada)."),
     4: ("HD (x4) - necesaria para los paquetes de texturas HD",
         {"PS2X_GS_SCALE": "4", "PS2X_GS_OUTPUT": "4", "PS2X_GS_PROMOTE": "1", "PS2X_GS_HD_SSAA": "1", "PS2X_GS_GPU_DOWNSCALE": "1"},
         "Cuatro veces la resolucion interna. Exige una GPU potente; en una GPU integrada puede ir por debajo de la velocidad real."),
 }
 UNLOCK = {"PS2X_GS_PRESENT_UNLOCK": "1"}
+FASTBUF = {"PS2X_IPU_FASTBUF": "1"}
 
 
 def default_data_dir():
@@ -63,14 +67,16 @@ def mods_status(data_dir):
     return n_st, story, packs
 
 
-def build_launch(exe, res, data_dir, mods_off=False, unlock=False):
+def build_launch(exe, res, data_dir, mods_off=False, unlock=False, fastbuf=False):
     """Command line and environment (a copy of os.environ with the chosen variables) for the game."""
     env = dict(os.environ)
-    for k in ("PS2X_GS_SCALE", "PS2X_GS_OUTPUT", "PS2X_GS_PROMOTE", "PS2X_GS_HD_SSAA", "PS2X_GS_GPU_DOWNSCALE", "PS2X_GS_PRESENT_UNLOCK", "PS2X_MODS", "PS2X_STORY_EN"):
+    for k in ("PS2X_GS_SCALE", "PS2X_GS_OUTPUT", "PS2X_GS_PROMOTE", "PS2X_GS_HD_SSAA", "PS2X_GS_GPU_DOWNSCALE", "PS2X_GS_PRESENT_UNLOCK", "PS2X_IPU_FASTBUF", "PS2X_MODS", "PS2X_STORY_EN"):
         env.pop(k, None)  # no leftovers from the user's own shell
     env.update(RESOLUTIONS[res][1])
     if unlock:
         env.update(UNLOCK)
+    if fastbuf:
+        env.update(FASTBUF)
     if mods_off:
         env["PS2X_MODS"] = "off"
         env["PS2X_STORY_EN"] = "off"
@@ -85,7 +91,7 @@ def selftest(argv):
     if "--res" in argv:
         res = int(argv[argv.index("--res") + 1])
     exe = Path(__file__).resolve().parent / EXE_NAME
-    cmd, env = build_launch(exe, res, default_data_dir(), "--no-mods" in argv, "--unlock" in argv)
+    cmd, env = build_launch(exe, res, default_data_dir(), "--no-mods" in argv, "--unlock" in argv, "--fastbuf" in argv)
     print("command:", cmd)
     for k in sorted(env):
         if k.startswith("PS2X_"):
@@ -131,11 +137,13 @@ def run_gui():
 
     mods_off = tk.BooleanVar(value=bool(cfg.get("mods_off", False)))
     unlock = tk.BooleanVar(value=bool(cfg.get("unlock", False)))
+    fastbuf = tk.BooleanVar(value=bool(cfg.get("fastbuf", False)))
     ttk.Checkbutton(frm, text="Jugar sin mods (juego original en japones)", variable=mods_off).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
     ttk.Checkbutton(frm, text="Presentacion sin bloqueo (EXPERIMENTAL: puede mejorar x2/x4 en GPUs lentas)", variable=unlock).grid(row=9, column=0, columnspan=2, sticky="w")
+    ttk.Checkbutton(frm, text="Cola de video rapida (EXPERIMENTAL: menos CPU en los videos)", variable=fastbuf).grid(row=10, column=0, columnspan=2, sticky="w")
 
     status = tk.StringVar()
-    ttk.Label(frm, textvariable=status, wraplength=420, justify="left").grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    ttk.Label(frm, textvariable=status, wraplength=420, justify="left").grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def refresh():
         n_st, story, packs = mods_status(data_var.get())
@@ -143,8 +151,8 @@ def run_gui():
         parts.append("Traduccion: %s" % ("instalada (%d archivos%s)" % (n_st, " + dialogos" if story else "") if n_st or story else "no instalada"))
         parts.append("Texturas HD: %s" % (", ".join(packs) if packs else "ninguna"))
         msg = "\n".join(parts)
-        if packs and res_var.get() != 4:
-            msg += "\nAviso: los paquetes HD solo se ven en la resolucion x4."
+        if packs and res_var.get() not in (3, 4):
+            msg += "\nAviso: los paquetes HD solo se ven en las resoluciones HD (x2 HD o x4)."
         if not (Path(data_var.get()) / "disc").exists() and not exe.exists():
             msg += "\nAviso: no se encuentra %s junto al launcher." % EXE_NAME
         status.set(msg)
@@ -155,8 +163,8 @@ def run_gui():
             messagebox.showerror("Shining Wind", "No encuentro %s en %s" % (EXE_NAME, here))
             return
         d = data_var.get().strip() or str(default_data_dir())
-        save_config({"res": res_var.get(), "data_dir": d if Path(d) != default_data_dir() else "", "mods_off": mods_off.get(), "unlock": unlock.get()})
-        cmd, env = build_launch(exe, res_var.get(), d, mods_off.get(), unlock.get())
+        save_config({"res": res_var.get(), "data_dir": d if Path(d) != default_data_dir() else "", "mods_off": mods_off.get(), "unlock": unlock.get(), "fastbuf": fastbuf.get()})
+        cmd, env = build_launch(exe, res_var.get(), d, mods_off.get(), unlock.get(), fastbuf.get())
         try:
             subprocess.Popen(cmd, env=env, cwd=str(here))
         except OSError as e:
@@ -170,7 +178,7 @@ def run_gui():
         os.startfile(str(p))  # noqa: windows only, like the game
 
     btn = ttk.Frame(frm)
-    btn.grid(row=11, column=0, columnspan=2, sticky="we", pady=(12, 0))
+    btn.grid(row=12, column=0, columnspan=2, sticky="we", pady=(12, 0))
     ttk.Button(btn, text="Jugar", command=play).grid(row=0, column=0, padx=(0, 6))
     ttk.Button(btn, text="Como instalar mods...", command=lambda: webbrowser.open(GUIDE_URL)).grid(row=0, column=1, padx=6)
     ttk.Button(btn, text="Carpeta mods", command=lambda: open_dir("mods")).grid(row=0, column=2, padx=6)

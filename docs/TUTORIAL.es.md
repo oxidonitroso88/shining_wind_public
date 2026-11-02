@@ -72,10 +72,10 @@ Las partidas (memory card virtual) van a `<carpeta de datos>\memcards` y un regi
 
 ## 6b. Launcher (elegir la resolución)
 
-Doble clic en **`Launcher.cmd`** (usa el Python con el que compilaste): elegís la resolución (**x1** original, **x2** mejorada, **x4** HD), la carpeta de datos, si querés jugar sin mods, y pulsás **Jugar**. Muestra qué traducción y paquetes HD tenés instalados, y el botón **Cómo instalar mods…** abre la guía [MODS.es.md](MODS.es.md). Recuerda tu última elección en `%APPDATA%\ShiningWind\launcher.json`. Solo establece las mismas variables de entorno que `play-x4.cmd` y arranca `ShiningWind.exe`; no cambia nada más. Los paquetes HD solo se ven en x4, y x4 exige una GPU potente (en una GPU integrada puede ir por debajo de la velocidad real).
+Doble clic en **`Launcher.cmd`** (usa el Python con el que compilaste): elegís la resolución (**x1** original, **x2** mejorada, **x4** HD), la carpeta de datos, si querés jugar sin mods, y pulsás **Jugar**. Muestra qué traducción y paquetes HD tenés instalados, y el botón **Cómo instalar mods…** abre la guía [MODS.es.md](MODS.es.md). Recuerda tu última elección en `%APPDATA%\ShiningWind\launcher.json`. Solo establece las mismas variables de entorno que `play-x4.cmd` y arranca `ShiningWind.exe`; no cambia nada más. Los paquetes HD solo se ven en las resoluciones HD (x2 HD o x4), y x4 exige una GPU potente (en una GPU integrada puede ir por debajo de la velocidad real).
 
 ## 7. Jugar en HD (×4)
-Usá **`play-x4.cmd`** en lugar de `ShiningWind.exe`: arranca el mismo programa con resolución interna ×4, que necesitan los paquetes de texturas HD.
+Usá **`play-x4.cmd`** en lugar de `ShiningWind.exe`: arranca el mismo programa con resolución interna ×4. Los paquetes de texturas HD también se ven con la opción **«HD ligero (x2 + texturas HD)»** del launcher (resolución ×2 con `PS2X_GS_PROMOTE=1`): en una ventana de 1280×896 da las mismas imágenes que ×4 (comprobado en una RTX y en una GPU integrada Vega 7, en título, historia y campo) con mucha menos carga de GPU. ×4 solo aporta más detalle en ventanas más grandes y exige una GPU potente.
 
 **Controles** (teclado, si no hay mando conectado; con mando solo se usa el mando): **C** = ○, **X/Espacio** = ✕, **Z** = □, **V** = △, **Enter** = Start, **Tab** = Select, **Q/E** = L1/R1, **Shift izq./der.** = L2/R2, **flechas** = cruceta, **WASD** = stick izquierdo (caminar). No uses Esc como botón: cierra la ventana. **F10** activa/desactiva las texturas HD; **F7** abre el panel de extras.
 
@@ -85,7 +85,7 @@ La traducción al inglés y los paquetes de texturas HD **no** están en este re
 %APPDATA%\ShiningWind\mods\        <- archivos de la traducción (ST\*.RAX y story_en.tsv)
 %APPDATA%\ShiningWind\hd_packs\    <- una carpeta por paquete de texturas (cada una con su manifest.json)
 ```
-Se cargan al arrancar el juego. Los paquetes HD necesitan `play-x4.cmd`.
+Se cargan al arrancar el juego. Los paquetes HD necesitan una resolución HD: `play-x4.cmd` o «HD ligero (x2)» en el launcher.
 
 Guía detallada (qué archivos son, subcarpetas, cómo comprobarlo y qué hacer si falla): [MODS.es.md](MODS.es.md) / [MODS.en.md](MODS.en.md).
 
