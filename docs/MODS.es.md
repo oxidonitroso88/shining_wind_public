@@ -71,7 +71,7 @@ Reglas:
 
 * **Una carpeta por paquete**, con su `manifest.json` directamente dentro. No la dejes dentro de otra carpeta adicional (`hd_packs\Paquete\Paquete\manifest.json` **no** funciona).
 * El `manifest.json` identifica cada textura por el archivo y recurso del juego y por su contenido (hash); si tu disco no es la edición NTSC-J SLPM-66671, no coincidirá y no se aplicará nada (el juego se ve como el original).
-* **Hace falta una resolución HD:** arrancá con **`play-x4.cmd`** o, mejor para PCs modestas, con el launcher y la opción **«HD ligero (x2 + texturas HD)»** (misma imagen que ×4 en una ventana de 1280×896 con mucha menos carga de GPU). Con ×1 o con ×2 normal los paquetes HD no se ven.
+* **Hace falta una resolución HD:** arrancá con **`play-x4.cmd`** o, mejor para PCs modestas, con el launcher y la opción **«HD ligero (x2 + texturas HD)»** (parecido a ×4 con mucha menos carga de GPU; usa `PS2X_GS_HD_SSAA=1`, sin él los bordes salen dentados). Con ×1 o con ×2 normal los paquetes HD no se ven.
 * Podés tener varios paquetes a la vez (p. ej. uno de retratos y otro de menús). **Evitá que dos paquetes reemplacen la misma textura**; si lo hacen, solo se usa una de las dos y no está garantizado cuál.
 * Cuesta memoria de vídeo: cuantos más paquetes y más grandes, más VRAM. El juego descarta las texturas menos usadas si se queda sin presupuesto (`PS2X_HD_BUDGET_MB`, 512 MB por defecto).
 * **F10** activa/desactiva los reemplazos HD con el juego en marcha: sirve para comparar con el original al instante.

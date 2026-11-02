@@ -39,7 +39,7 @@ hd_packs\
     textures\*.png
 ```
 
-* Start with **`play-x4.cmd`** (×4) or, better for modest PCs, the launcher's **"HD light (x2 + HD textures)"** option (same picture as ×4 in a 1280x896 window with far less GPU load). At ×1 or plain ×2 HD packs are not shown.
+* Start with **`play-x4.cmd`** (×4) or, better for modest PCs, the launcher's **"HD light (x2 + HD textures)"** option (close to ×4 with far less GPU load; it uses `PS2X_GS_HD_SSAA=1`, without it edges look jagged). At ×1 or plain ×2 HD packs are not shown.
 * The manifest matches textures by game file, resource and content hash: with a different disc edition nothing applies and the game looks original.
 * Avoid two packs replacing the same texture (only one is used, which one is not guaranteed).
 * More/larger packs use more VRAM (`PS2X_HD_BUDGET_MB`, default 512).
