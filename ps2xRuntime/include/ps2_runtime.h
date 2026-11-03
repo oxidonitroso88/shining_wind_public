@@ -27,6 +27,7 @@
 #include <unordered_set>
 
 #include "ps2_log.h"
+#include "ps2_perf.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -278,7 +279,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
-    if (ps2SifGuestTraceActive && ctx && ps2SifGuestTraceWrites++ < 96)
+    if (ps2SifGuestTraceActive && ctx && ps2SifGuestTraceWrites++ < 96 && ps2perf::sifTrace())
     {
         std::cerr << "[SIF:guest-write] pc=0x" << std::hex << ctx->pc
                   << " addr=0x" << guestAddr << " size=" << std::dec << size

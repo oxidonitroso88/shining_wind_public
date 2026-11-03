@@ -12,6 +12,8 @@
 #include "device.hpp"
 #include "thread_id.hpp"
 
+#include "ps2_perf.h"
+#include "ps2_perf_irq.h"
 #include "runtime/gs/gs_parallel_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_raw_tap.h"
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,8 +36,293 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace
 {
+    // PS2X_GS_VKLOG=1: diagnostics for GPUs where the Vulkan driver crashes (see docs/vulkan-amd-startup-crash-2026-10-30.md). Writes to stderr and to
+    // %APPDATA%\ShiningWind\vk_diag.log (the release exe has no console), reports which descriptor path Granite chose, keeps the last backend stage in a
+    // global and installs a vectored handler that logs the stage, the faulting module+offset and a stack trace on an access violation. Off: nothing changes.
+    namespace vkdiag
+    {
+        bool g_on = false;
+        std::FILE *g_file = nullptr;
+        std::atomic<const char *> g_stage{"(none)"};
+        std::atomic<uint64_t> g_stageCount{0};
+        std::atomic<int> g_shaderIndex{-1};          // shader module being created (vkCreateShaderModule wrapper); -1 outside of it
+        std::atomic<uint64_t> g_shaderHash{0};
+        std::atomic<size_t> g_shaderBytes{0};
+        PFN_vkCreateShaderModule g_realCreateShaderModule = nullptr;
+
+        void log(const char *fmt, ...)
+        {
+            if (!g_on)
+                return;
+            char line[1024];
+            va_list ap;
+            va_start(ap, fmt);
+            std::vsnprintf(line, sizeof(line), fmt, ap);
+            va_end(ap);
+            std::fputs(line, stderr);
+            if (g_file)
+            {
+                std::fputs(line, g_file);
+                std::fflush(g_file);
+            }
+        }
+
+        // Records the stage the backend is entering; logs the first time each distinct stage (string literal address) is seen.
+        void stage(const char *name)
+        {
+            if (!g_on)
+                return;
+            g_stage.store(name, std::memory_order_relaxed);
+            g_stageCount.fetch_add(1, std::memory_order_relaxed);
+            static std::mutex m;
+            static std::vector<const char *> seen;
+            std::lock_guard<std::mutex> lock(m);
+            if (std::find(seen.begin(), seen.end(), name) != seen.end())
+                return;
+            seen.push_back(name);
+            log("[vkdiag] stage (first time): %s\n", name);
+        }
+
+#ifdef _WIN32
+        void describeAddress(void *addr, char *out, size_t outSize)
+        {
+            HMODULE mod = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(addr), &mod) && mod)
+            {
+                char path[MAX_PATH] = {};
+                GetModuleFileNameA(mod, path, MAX_PATH);
+                const char *base = std::strrchr(path, '\\');
+                std::snprintf(out, outSize, "%s+0x%llx", base ? base + 1 : path, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod)));
+            }
+            else
+                std::snprintf(out, outSize, "%p", addr);
+        }
+
+        LONG CALLBACK onException(EXCEPTION_POINTERS *info)
+        {
+            const DWORD code = info->ExceptionRecord->ExceptionCode;
+            if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW)
+                return EXCEPTION_CONTINUE_SEARCH;
+            static std::atomic<bool> once{false};
+            if (once.exchange(true))
+                return EXCEPTION_CONTINUE_SEARCH;
+            char where[512];
+            describeAddress(info->ExceptionRecord->ExceptionAddress, where, sizeof(where));
+            if (g_shaderIndex.load() >= 0)
+                log("[vkdiag] EXCEPTION happened INSIDE vkCreateShaderModule: shader #%d, %zu bytes, hash %016llx\n", g_shaderIndex.load(), g_shaderBytes.load(),
+                    static_cast<unsigned long long>(g_shaderHash.load()));
+            log("[vkdiag] EXCEPTION 0x%08lX at %s, stage '%s' (#%llu), access %s address 0x%llx\n", code, where, g_stage.load(), static_cast<unsigned long long>(g_stageCount.load()),
+                info->ExceptionRecord->NumberParameters > 0 ? (info->ExceptionRecord->ExceptionInformation[0] == 0 ? "READ" : info->ExceptionRecord->ExceptionInformation[0] == 1 ? "WRITE" : "EXEC") : "?",
+                info->ExceptionRecord->NumberParameters > 1 ? static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[1]) : 0ull);
+            void *frames[32];
+            const USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
+            for (USHORT i = 0; i < n; ++i)
+            {
+                describeAddress(frames[i], where, sizeof(where));
+                log("[vkdiag]   #%u %s\n", static_cast<unsigned>(i), where);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+#endif
+
+        // Creation order of the shaders of ParallelGS::Shaders (gs/shaders/slangmosh.hpp). Shaders with identical SPIR-V are created once (upscale_vert
+        // reuses sharpen_vert), so names after that point are the likely ones; size and hash are the reliable identity.
+        const char *const kShaderNames[] = {"binning", "upload[0]", "upload[1]", "clut_write", "vram_copy", "triangle_setup", "single_sample_heuristic", "ubershader[0][0]",
+                                            "ubershader[1][0]", "ubershader[0][1]", "ubershader[1][1]", "quad", "sample_circuit[0]", "sample_circuit[1]", "blit_circuit", "weave",
+                                            "sharpen_vert (= upscale_vert)", "sharpen_frag", "upscale_frag", "blit", "extwrite", "qword_clear", "sampler_feedback", "ui_vert",
+                                            "ui_frag[0][0]", "ui_frag[1][0]", "ui_frag[0][1]", "ui_frag[1][1]"};
+
+        const char *capabilityName(uint32_t c)
+        {
+            switch (c)
+            {
+            case 1: return "Shader";
+            case 9: return "Float16";
+            case 10: return "Float64";
+            case 11: return "Int64";
+            case 12: return "Int64Atomics";
+            case 22: return "Int16";
+            case 39: return "Int8";
+            case 61: return "GroupNonUniform";
+            case 62: return "GroupNonUniformVote";
+            case 63: return "GroupNonUniformArithmetic";
+            case 64: return "GroupNonUniformBallot";
+            case 65: return "GroupNonUniformShuffle";
+            case 66: return "GroupNonUniformShuffleRelative";
+            case 67: return "GroupNonUniformClustered";
+            case 68: return "GroupNonUniformQuad";
+            case 4433: return "StorageBuffer16BitAccess";
+            case 4434: return "UniformAndStorageBuffer16BitAccess";
+            case 4448: return "StorageBuffer8BitAccess";
+            case 4449: return "UniformAndStorageBuffer8BitAccess";
+            case 5301: return "ShaderNonUniform";
+            case 5302: return "RuntimeDescriptorArray";
+            case 5345: return "VulkanMemoryModel";
+            case 5347: return "PhysicalStorageBufferAddresses";
+            default: return "?";
+            }
+        }
+
+        std::string literalString(const uint32_t *words, uint32_t wordCount)
+        {
+            const char *s = reinterpret_cast<const char *>(words);
+            size_t n = 0;
+            while (n < static_cast<size_t>(wordCount) * 4u && s[n])
+                ++n;
+            return std::string(s, n);
+        }
+
+        // Module-level scan of the SPIR-V (bounds checked, the logger must not crash on a bad module): version, capabilities, extensions, entry points, local size.
+        void describeSpirv(const uint32_t *code, size_t words)
+        {
+            if (words < 5 || code[0] != 0x07230203u)
+            {
+                log("[vkdiag]   NOT valid SPIR-V (magic 0x%08x, %zu words)\n", words ? code[0] : 0u, words);
+                return;
+            }
+            log("[vkdiag]   SPIR-V version %u.%u generator 0x%08x bound %u\n", (code[1] >> 16) & 0xFF, (code[1] >> 8) & 0xFF, code[2], code[3]);
+            std::string caps, exts;
+            size_t i = 5;
+            while (i < words)
+            {
+                const uint32_t op = code[i] & 0xFFFFu, n = code[i] >> 16;
+                if (n == 0 || i + n > words)
+                {
+                    log("[vkdiag]   malformed instruction at word %zu\n", i);
+                    break;
+                }
+                if (op == 17 && n >= 2) // OpCapability
+                    caps += std::to_string(code[i + 1]) + "(" + capabilityName(code[i + 1]) + ") ";
+                else if (op == 10 && n >= 2) // OpExtension
+                    exts += literalString(&code[i + 1], n - 1) + " ";
+                else if (op == 15 && n >= 4) // OpEntryPoint: model, id, name
+                    log("[vkdiag]   entry point model %u '%s'\n", code[i + 1], literalString(&code[i + 3], n - 3).c_str());
+                else if (op == 16 && n >= 6 && code[i + 2] == 17) // OpExecutionMode LocalSize
+                    log("[vkdiag]   LocalSize %u x %u x %u\n", code[i + 3], code[i + 4], code[i + 5]);
+                else if (op == 54) // OpFunction: every capability / extension is declared before the first one
+                    break;
+                i += n;
+            }
+            log("[vkdiag]   capabilities: %s\n", caps.c_str());
+            log("[vkdiag]   extensions: %s\n", exts.empty() ? "(none)" : exts.c_str());
+        }
+
+        VKAPI_ATTR VkResult VKAPI_CALL wrappedCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info, const VkAllocationCallbacks *alloc, VkShaderModule *module)
+        {
+            static std::atomic<int> counter{0};
+            const int index = counter.fetch_add(1);
+            uint64_t hash = 1469598103934665603ull; // FNV-1a over the code words
+            const size_t words = info->codeSize / 4u;
+            for (size_t i = 0; i < words; ++i)
+                hash = (hash ^ info->pCode[i]) * 1099511628211ull;
+            const char *name = index < static_cast<int>(sizeof(kShaderNames) / sizeof(kShaderNames[0])) ? kShaderNames[index] : "(beyond the known list)";
+            log("[vkdiag] vkCreateShaderModule #%d (likely '%s'): %zu bytes, hash %016llx, flags 0x%x, pNext %p\n", index, name, static_cast<size_t>(info->codeSize),
+                static_cast<unsigned long long>(hash), static_cast<unsigned>(info->flags), info->pNext);
+            describeSpirv(info->pCode, words);
+            // PS2X_GS_VKLOG_DUMP_SPIRV=1: the exact SPIR-V handed to the driver, written BEFORE the call (it survives a crash inside it) to
+            // %APPDATA%\ShiningWind\spirv\<index>_<hash>.spv, for spirv-val / spirv-dis and for comparing builds.
+            if (const char *dump = std::getenv("PS2X_GS_VKLOG_DUMP_SPIRV"); dump && dump[0] != '0')
+            {
+                if (const char *appdata = std::getenv("APPDATA"))
+                {
+                    const std::string dir = std::string(appdata) + "\\ShiningWind\\spirv";
+                    CreateDirectoryA(dir.c_str(), nullptr);
+                    char file[64];
+                    std::snprintf(file, sizeof(file), "\\%02d_%016llx.spv", index, static_cast<unsigned long long>(hash));
+                    if (std::FILE *f = std::fopen((dir + file).c_str(), "wb"))
+                    {
+                        std::fwrite(info->pCode, 1, info->codeSize, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+            g_shaderIndex.store(index);
+            g_shaderHash.store(hash);
+            g_shaderBytes.store(info->codeSize);
+            const VkResult r = g_realCreateShaderModule(device, info, alloc, module);
+            g_shaderIndex.store(-1);
+            log("[vkdiag]   -> vkCreateShaderModule #%d returned %d, module %p\n", index, static_cast<int>(r), module ? reinterpret_cast<void *>(*module) : nullptr);
+            return r;
+        }
+
+        // Replaces the entry of the device's function table that Granite's Shader::Shader calls (device_table.vkCreateShaderModule).
+        void hookShaderCreation(const Vulkan::Device &dev)
+        {
+            if (!g_on)
+                return;
+            auto &table = const_cast<VolkDeviceTable &>(dev.get_device_table());
+            if (!table.vkCreateShaderModule)
+                return;
+            g_realCreateShaderModule = table.vkCreateShaderModule;
+            table.vkCreateShaderModule = wrappedCreateShaderModule;
+            log("[vkdiag] vkCreateShaderModule is being logged\n");
+        }
+
+        void init()
+        {
+            const char *v = std::getenv("PS2X_GS_VKLOG");
+            if (!v || v[0] == '0')
+                return;
+            g_on = true;
+#ifdef _WIN32
+            if (const char *appdata = std::getenv("APPDATA"))
+            {
+                const std::string dir = std::string(appdata) + "\\ShiningWind";
+                CreateDirectoryA(dir.c_str(), nullptr);
+                g_file = std::fopen((dir + "\\vk_diag.log").c_str(), "w");
+            }
+            AddVectoredExceptionHandler(1, onException);
+#endif
+            log("[vkdiag] enabled (log file %s)\n", g_file ? "%APPDATA%\\ShiningWind\\vk_diag.log" : "unavailable");
+        }
+
+        // What Granite actually selected on this device (nothing is assumed: the values come from the created device).
+        void reportDevice(const Vulkan::Context &ctx, const Vulkan::Device &dev)
+        {
+            if (!g_on)
+                return;
+            const VkPhysicalDeviceProperties &p = ctx.get_gpu_props();
+            const Vulkan::DeviceFeatures &f = ctx.get_enabled_device_features();
+            const Vulkan::DeviceFeatures &d = dev.get_device_features();
+            log("[vkdiag] GPU '%s' vendor 0x%04x device 0x%04x driver %u.%u.%u (0x%08x) api %u.%u.%u driverId %d\n", p.deviceName, p.vendorID, p.deviceID, VK_API_VERSION_MAJOR(p.driverVersion),
+                VK_API_VERSION_MINOR(p.driverVersion), VK_API_VERSION_PATCH(p.driverVersion), p.driverVersion, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
+                VK_API_VERSION_PATCH(p.apiVersion), static_cast<int>(f.driver_id));
+            log("[vkdiag] descriptor path: descriptorBuffer feature=%d supports_descriptor_buffer=%d descriptorHeap feature=%d supports_buffer_or_heap=%d (device copy: buffer=%d heap_or_buffer=%d)\n",
+                f.descriptor_buffer_features.descriptorBuffer, f.supports_descriptor_buffer, f.descriptor_heap_features.descriptorHeap, f.supports_descriptor_buffer_or_heap,
+                d.supports_descriptor_buffer, d.supports_descriptor_buffer_or_heap);
+            const auto &db = f.descriptor_buffer_properties;
+            log("[vkdiag] descriptor buffer props: combinedImageSamplerDescriptorSingleArray=%d samplerDescSize=%zu sampledImageDescSize=%zu maxSamplerRange=%llu maxResourceRange=%llu offsetAlignment=%llu\n",
+                db.combinedImageSamplerDescriptorSingleArray, static_cast<size_t>(db.samplerDescriptorSize), static_cast<size_t>(db.sampledImageDescriptorSize),
+                static_cast<unsigned long long>(db.maxSamplerDescriptorBufferRange), static_cast<unsigned long long>(db.maxResourceDescriptorBufferRange),
+                static_cast<unsigned long long>(db.descriptorBufferOffsetAlignment));
+            log("[vkdiag] required by sizeof*512K: sampler %llu, sampledImage %llu bytes\n", static_cast<unsigned long long>(db.samplerDescriptorSize) * 512ull * 1024ull,
+                static_cast<unsigned long long>(db.sampledImageDescriptorSize) * 512ull * 1024ull);
+            const auto &v12 = f.vk12_features;
+            log("[vkdiag] vk1.2: descriptorIndexing=%d runtimeDescriptorArray=%d descriptorBindingPartiallyBound=%d nonUniformIndexing(sampled)=%d bufferDeviceAddress=%d shaderInt8=%d storage8=%d\n",
+                v12.descriptorIndexing, v12.runtimeDescriptorArray, v12.descriptorBindingPartiallyBound, v12.shaderSampledImageArrayNonUniformIndexing, v12.bufferDeviceAddress,
+                v12.shaderInt8, v12.storageBuffer8BitAccess);
+            log("[vkdiag] vk1.3: sync2=%d subgroupSizeControl=%d computeFullSubgroups=%d  feat: shaderInt64=%d shaderInt16=%d storage16=%d\n", f.vk13_features.synchronization2,
+                f.vk13_features.subgroupSizeControl, f.vk13_features.computeFullSubgroups, f.enabled_features.shaderInt64, f.enabled_features.shaderInt16,
+                f.vk11_features.storageBuffer16BitAccess);
+            log("[vkdiag] subgroup: size %u (min %u max %u) supportedStages 0x%x supportedOperations 0x%x; maxComputeSharedMemory %u\n", f.vk11_props.subgroupSize, f.vk13_props.minSubgroupSize,
+                f.vk13_props.maxSubgroupSize, f.vk11_props.subgroupSupportedStages, f.vk11_props.subgroupSupportedOperations, p.limits.maxComputeSharedMemorySize);
+            log("[vkdiag] enabled device extensions (%u):\n", f.num_device_extensions);
+            for (uint32_t i = 0; i < f.num_device_extensions; ++i)
+                log("[vkdiag]   %s\n", f.device_extensions[i]);
+        }
+    }
+
+#define VKDIAG_STAGE(name) vkdiag::stage(name)
+
     constexpr uint32_t kVramSize = 4u * 1024u * 1024u;
     constexpr uint32_t kMaxImageQwordsPerTag = 0x7FFFu; // GIF NLOOP is 15 bits
 
@@ -43,16 +331,23 @@ namespace
     public:
         ParallelGSBackend()
         {
+            vkdiag::init();
+            VKDIAG_STAGE("ctor: init_loader");
             if (!Vulkan::Context::init_loader(nullptr))
                 throw std::runtime_error("no Vulkan loader");
             m_context.set_num_thread_indices(1);
+            VKDIAG_STAGE("ctor: init_instance_and_device");
             if (!m_context.init_instance_and_device(nullptr, 0, nullptr, 0,
                                                     Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
                                                         Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
                                                         Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
                 throw std::runtime_error("Vulkan device creation failed (a GPU with descriptor indexing, subgroup ops and descriptor buffers is required)");
+            VKDIAG_STAGE("ctor: device.set_context");
             m_device.set_context(m_context);
+            VKDIAG_STAGE("ctor: device.init_frame_contexts");
             m_device.init_frame_contexts(4);
+            vkdiag::reportDevice(m_context, m_device);
+            vkdiag::hookShaderCreation(m_device);
             // PS2X_GS_SCALE=1|2|4: internal resolution factor. 2 = 2x2 super-sampling (1280x896), 4 = 4x4 (2560x1792), scanned out at the higher
             // resolution (parallel-gs high_resolution_scanout). 1 (default) keeps the original 640x448 presentation through the CPU CRTC.
             // PS2X_GS_PROMOTE=1 enables parallel-gs' back-buffer promotion (replaces blitted scanout with the original higher-resolution input).
@@ -74,9 +369,18 @@ namespace
                 options.super_sampled_textures = true;
             if (const char *sstex = std::getenv("PS2X_GS_SSTEX"))
                 options.super_sampled_textures = sstex[0] != '0';
+            VKDIAG_STAGE("ctor: parallel-gs init (pipelines/shaders)");
             if (!m_gs.init(&m_device, options))
                 throw std::runtime_error("parallel-gs initialisation failed");
             std::fprintf(stderr, "[gs] internal resolution factor %d (PS2X_GS_SCALE), scanout factor %u (PS2X_GS_OUTPUT)\n", m_scale, 1u << m_outputLog2);
+            if (ps2perf::enabled())
+            {
+                ps2perf::setInfo("scale", std::to_string(m_scale).c_str());
+                ps2perf::setInfo("output", m_scale > 1 ? std::to_string(1u << m_outputLog2).c_str() : "n/a(x1)"); // the scanout factor only applies above x1
+                ps2perf::setInfo("gpu", (std::string(m_context.get_gpu_props().deviceName) + (m_presentUnlock ? " [present-unlock]" : "")).c_str());
+            }
+            if (m_presentUnlock)
+                std::fprintf(stderr, "[gs] PS2X_GS_PRESENT_UNLOCK=1: the high resolution presentation waits for its own fence without holding the backend mutex\n");
             {
                 ParallelGS::Hacks hacks{};
                 bool anyHack = false;
@@ -97,7 +401,7 @@ namespace
                 if (anyHack)
                     m_gs.set_hacks(hacks);
             }
-            if (std::getenv("PS2X_GS_PERF"))
+            if (std::getenv("PS2X_GS_PERF") || ps2perf::g_level >= 2)
             {
                 ParallelGS::DebugMode dm{};
                 dm.timestamps = true;       // GPU time per stage of the renderer, reported by PS2X_GS_PERF
@@ -112,6 +416,7 @@ namespace
                     m_forcedH = fh;
                 }
             }
+            VKDIAG_STAGE("ctor: done");
             m_gs.set_signal_interface(this);
             // HD texture packs (PS2X_HD_PACK): the host decides the identity of each texture, parallel-gs binds the replacement image. Always installed when a
             // pack was requested (the lookup is a no-op while replacements are off or no pack loaded); never installed otherwise.
@@ -141,9 +446,11 @@ namespace
         void OnGifPackets(const uint8_t *data, uint32_t sizeBytes) override
         {
             Lock lock(m_mutex);
+            VKDIAG_STAGE("OnGifPackets: gif_transfer");
             sizeBytes &= ~15u; // whole quadwords only (the frontend ignores a trailing partial tag as well)
             if (!data || !sizeBytes)
                 return;
+            const ps2perf::Scope perfScope(ps2perf::S::EeTapGif, sizeBytes);
             m_gs.gif_transfer(3, data, sizeBytes);
             m_gpuDirty = true;
         }
@@ -154,6 +461,8 @@ namespace
             // 0x58 and up are privileged/alias registers (DISPFB, DISPLAY, SIGNAL, ...): they never draw and are handled by the frontend.
             if (addr >= 0x58)
                 return;
+            VKDIAG_STAGE("OnRegister: write_register");
+            const ps2perf::Scope perfScope(ps2perf::S::EeTapRegister);
             m_gs.write_register(static_cast<ParallelGS::RegisterAddr>(addr), value);
             m_gpuDirty = true;
         }
@@ -163,6 +472,8 @@ namespace
             Lock lock(m_mutex);
             if (!data || !sizeBytes)
                 return;
+            VKDIAG_STAGE("OnImageUpload: write_register/gif_transfer");
+            const ps2perf::Scope perfScope(ps2perf::S::EeTapImage, sizeBytes);
             m_gs.write_register(ParallelGS::RegisterAddr::BITBLTBUF, bitbltbuf);
             m_gs.write_register(ParallelGS::RegisterAddr::TRXPOS, trxpos);
             m_gs.write_register(ParallelGS::RegisterAddr::TRXREG, trxreg);
@@ -193,6 +504,7 @@ namespace
             Lock lock(m_mutex);
             if (!vram || vramSize < kVramSize)
                 throw std::invalid_argument("parallel-gs backend requires 4 MiB of VRAM");
+            VKDIAG_STAGE("Initialize: pushHostVram");
             m_hostVram = vram;
             m_vramSize = vramSize;
             m_cpu.Initialize(vram, vramSize);
@@ -228,12 +540,14 @@ namespace
         void Flush() override
         {
             Lock lock(m_mutex);
+            VKDIAG_STAGE("Flush: gs.flush");
             m_gs.flush();
         }
 
         void Sync(GSSyncReason reason) override
         {
             Lock lock(m_mutex);
+            VKDIAG_STAGE("Sync: gs.flush");
             m_gs.flush();
             if (reason == GSSyncReason::Reset)
                 m_device.wait_idle();
@@ -241,18 +555,29 @@ namespace
 
         PresentationFrame Present(const GSPresentationRequest &request) override
         {
-            Lock lock(m_mutex);
+            std::unique_lock<std::mutex> presentSerial(m_presentSerial, std::defer_lock);
+            if (m_presentUnlock)
+                presentSerial.lock();
+            Lock lock(m_mutex, ps2perf::S::MainPresentLock);
+            const ps2perf::Scope perfScope(ps2perf::S::MainBackendPresent);
+            VKDIAG_STAGE("Present");
             if (m_hdStats && (++m_presents % 600u) == 0u)
                 reportHd();
             if (m_scale > 1 || m_vsyncPresent)
             {
                 PresentationFrame high = presentHighResolution(request);
+                collectGpuTimes();
+                collectFlushStats();
                 if (high)
                     return high;
             }
             gs_present_info::setLogicalSize(0u, 0u);
             mirrorHostVram();
-            return m_cpu.Present(request);
+            const ps2perf::Scope perfCpu(ps2perf::S::MainCpuPresent);
+            PresentationFrame low = m_cpu.Present(request);
+            collectGpuTimes();
+            collectFlushStats();
+            return low;
         }
 
         bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
@@ -352,8 +677,8 @@ namespace
         // Granite needs the calling thread registered; every entry point is serialised, so index 0 is shared.
         struct Lock
         {
-            std::lock_guard<std::recursive_mutex> guard;
-            explicit Lock(std::recursive_mutex &m) : guard(m) { Util::register_thread_index(0); }
+            ps2perf::TimedGuard<std::recursive_mutex> guard;
+            explicit Lock(std::recursive_mutex &m, ps2perf::S waitStage = ps2perf::S::EeTapLock) : guard(m, waitStage) { Util::register_thread_index(0); }
         };
 
         // The display area as the game programmed it is read by the CPU CRTC as (DW+1)/(MAGH+1) pixels (DW=639, MAGH=0 -> 640). parallel-gs models the real
@@ -459,7 +784,12 @@ namespace
 #endif
             if (info.high_resolution_scanout && std::getenv("PS2X_GS_SSAA_NOPROG") != nullptr) info.force_progressive = false; // experiment
             const auto perfT0 = std::chrono::steady_clock::now();
-            ParallelGS::ScanoutResult result = m_gs.vsync(info);
+            VKDIAG_STAGE("presentHighResolution: gs.vsync");
+            ParallelGS::ScanoutResult result;
+            {
+                const ps2perf::Scope perfVsync(ps2perf::S::MainVsync);
+                result = m_gs.vsync(info);
+            }
             const auto perfT1 = std::chrono::steady_clock::now();
             static int logged = 0;
             if (logged < 6)
@@ -511,9 +841,10 @@ namespace
                 info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
                 m_shrunk = m_device.create_image(info);
             }
+            VKDIAG_STAGE("presentHighResolution: readback command buffer");
             auto cmd = m_device.request_command_buffer();
             Vulkan::QueryPoolHandle tsStart, tsEnd;
-            if (m_perf)
+            if (m_gpuTs)
                 tsStart = cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
             cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                                VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -530,12 +861,51 @@ namespace
             else
                 cmd->copy_image_to_buffer(*readback, *result.image, 0, {}, {w, h, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
             cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-            if (m_perf)
+            if (m_gpuTs)
                 tsEnd = cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-            m_device.submit(cmd);
-            m_device.wait_idle();
-            if (m_perf && tsStart && tsEnd && tsStart->is_signalled() && tsEnd->is_signalled())
-                m_perfGpuPresent += m_device.convert_device_timestamp_delta(tsStart->get_timestamp_ticks(), tsEnd->get_timestamp_ticks()) * 1000.0;
+            // PS2X_GS_PRESENT_UNLOCK: Present() holds m_mutex exactly once here (it is only called by the presenter, never from inside a backend call), so a
+            // single unlock really releases it. Only this thread's own objects (readback buffer, result.image, the fence) are touched while it is released;
+            // nothing that needs Granite's thread index 0 or parallel-gs state (map_host_buffer and Fence::wait take no command buffer / pool).
+            const bool unlocked = m_presentUnlock;
+            if (unlocked)
+            {
+                Vulkan::Fence fence;
+                m_device.submit(cmd, &fence); // submit with a fence flushes the queue: the fence is valid and signals when the read-back is done
+                m_mutex.unlock();
+                {
+                    const ps2perf::Scope perfWait(ps2perf::S::MainWaitIdle);
+                    fence->wait();
+                }
+            }
+            else
+            {
+                const ps2perf::Scope perfWait(ps2perf::S::MainWaitIdle);
+                m_device.submit(cmd);
+                m_device.wait_idle();
+            }
+            // the mutex is taken again before leaving (the caller's Lock unlocks it), also on the early return below
+            struct Relock
+            {
+                ParallelGSBackend *self;
+                bool active;
+                void now()
+                {
+                    if (active)
+                    {
+                        self->m_mutex.lock();
+                        Util::register_thread_index(0);
+                        active = false;
+                    }
+                }
+                ~Relock() { now(); }
+            } relock{this, unlocked};
+            if (!unlocked && m_gpuTs && tsStart && tsEnd && tsStart->is_signalled() && tsEnd->is_signalled())
+            {
+                const double presentSeconds = m_device.convert_device_timestamp_delta(tsStart->get_timestamp_ticks(), tsEnd->get_timestamp_ticks());
+                m_perfGpuPresent += presentSeconds * 1000.0;
+                if (ps2perf::enabled())
+                    ps2perf::add(ps2perf::S::GpuPresentCopy, static_cast<uint64_t>(presentSeconds * 1.0e9));
+            }
             const uint8_t *src = static_cast<const uint8_t *>(m_device.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
             if (!src)
                 return frame;
@@ -543,6 +913,7 @@ namespace
             // one pass: copy and force the alpha channel opaque (32-bit words, little endian: A is the top byte)
             frame.pixels.resize(static_cast<size_t>(w) * h * 4u);
             {
+                const ps2perf::Scope perfCopy(ps2perf::S::MainHostCopy, static_cast<uint64_t>(w) * h * 4u);
                 const size_t words = static_cast<size_t>(w) * h;
                 uint32_t *dst = reinterpret_cast<uint32_t *>(frame.pixels.data());
                 for (size_t i = 0; i < words; ++i)
@@ -552,6 +923,7 @@ namespace
                     dst[i] = px | 0xFF000000u;
                 }
             }
+            relock.now(); // the code below uses parallel-gs state again
             if (m_perf)
                 perfRecord(perfT0, perfT1, perfT2, std::chrono::steady_clock::now(), w, h);
             frame.width = w;
@@ -563,6 +935,42 @@ namespace
             const uint32_t logicalHeight = result.mode_height * (((request.smode2 & 1u) && !wholeFrame) ? 2u : 1u);
             gs_present_info::setLogicalSize(result.high_resolution_scanout ? result.mode_width : 0u, result.high_resolution_scanout ? logicalHeight : 0u);
             return frame;
+        }
+
+        // PS2X_PERF (any level, 0016): work the renderer flushed since the previous present (primitives, render passes, palette updates, copies). Called with
+        // m_mutex held (Present re-takes it before returning), the same lock the EE holds while it feeds the renderer, so the stats are not read concurrently.
+        void collectFlushStats()
+        {
+            if (!ps2perf::enabled())
+                return;
+            const ParallelGS::FlushStats fs = m_gs.consume_flush_stats();
+            auto &g = ps2perf::g_gsFlush;
+            g.primitives.fetch_add(fs.num_primitives, std::memory_order_relaxed);
+            g.renderPasses.fetch_add(fs.num_render_passes, std::memory_order_relaxed);
+            g.paletteUpdates.fetch_add(fs.num_palette_updates, std::memory_order_relaxed);
+            g.copies.fetch_add(fs.num_copies, std::memory_order_relaxed);
+            g.copyBarriers.fetch_add(fs.num_copy_barriers, std::memory_order_relaxed);
+            g.presents.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // PS2X_PERF=2: GPU time spent per renderer stage since the previous call, from parallel-gs' timestamp queries (executed GPU time, not waiting).
+        void collectGpuTimes()
+        {
+            if (!ps2perf::enabled() || ps2perf::g_level < 2)
+                return;
+            static const struct { ParallelGS::TimestampType type; ps2perf::S stage; } map[] = {
+                {ParallelGS::TimestampType::Shading, ps2perf::S::GpuShading},        {ParallelGS::TimestampType::Binning, ps2perf::S::GpuBinning},
+                {ParallelGS::TimestampType::TriangleSetup, ps2perf::S::GpuSetup},    {ParallelGS::TimestampType::VSync, ps2perf::S::GpuVsync},
+                {ParallelGS::TimestampType::TextureUpload, ps2perf::S::GpuTexUpload}, {ParallelGS::TimestampType::CopyVRAM, ps2perf::S::GpuCopyVram},
+                {ParallelGS::TimestampType::Readback, ps2perf::S::GpuReadback}};
+            for (const auto &m : map)
+            {
+                const double now = m_gs.get_accumulated_timestamps(m.type);
+                const double d = now - m_perfGpuPrev2[int(m.type)];
+                m_perfGpuPrev2[int(m.type)] = now;
+                if (d > 0.0)
+                    ps2perf::add(m.stage, static_cast<uint64_t>(d * 1.0e9));
+            }
         }
 
         // PS2X_GS_PERF=1: every 300 presents, average cost (ms) of the parts of the high resolution presentation and the real period between presents.
@@ -614,6 +1022,8 @@ namespace
         {
             if (!m_gpuDirty || !m_hostVram)
                 return;
+            VKDIAG_STAGE("mirrorHostVram: flush + map_vram_read");
+            const ps2perf::Scope perfScope(ps2perf::S::MainMirror, m_vramSize);
             m_gs.flush();
             const void *vram = m_gs.map_vram_read(0, m_vramSize);
             std::memcpy(m_hostVram, vram, m_vramSize);
@@ -625,6 +1035,8 @@ namespace
         {
             if (!m_hostVram)
                 return;
+            VKDIAG_STAGE("pushHostVram: map_vram_read/map_vram_write/end_vram_write");
+            const ps2perf::Scope perfScope(ps2perf::S::PushVram, m_vramSize);
             (void)m_gs.map_vram_read(0, m_vramSize); // make the shadow current before overwriting it
             std::memcpy(m_gs.map_vram_write(0, m_vramSize), m_hostVram, m_vramSize);
             m_gs.end_vram_write(0, m_vramSize);
@@ -661,6 +1073,8 @@ namespace
         double m_perfGpuPrev[int(ParallelGS::TimestampType::Count)] = {};
         VkDeviceSize m_readbackSize = 0;
         bool m_perf = std::getenv("PS2X_GS_PERF") != nullptr;
+        bool m_gpuTs = std::getenv("PS2X_GS_PERF") != nullptr || ps2perf::g_level >= 2; // GPU timestamp queries around the presentation copy
+        double m_perfGpuPrev2[int(ParallelGS::TimestampType::Count)] = {};
         std::chrono::steady_clock::time_point m_perfLast{};
         double m_perfVsync = 0, m_perfWait = 0, m_perfCopy = 0, m_perfPeriod = 0, m_perfMax = 0;
         uint32_t m_perfN = 0, m_perfLate = 0, m_perfSpikeLines = 0;
@@ -668,6 +1082,10 @@ namespace
         int m_scale = 1;
         uint32_t m_outputLog2 = 1; // log2 of the high resolution scanout factor (PS2X_GS_OUTPUT)
         bool m_vsyncPresent = std::getenv("PS2X_GS_VSYNC_PRESENT") != nullptr; // experiment: scan out through parallel-gs even at 1x
+        // PS2X_GS_PRESENT_UNLOCK=1 (experiment, off by default): the high resolution presentation submits its read-back with a fence and waits for THAT fence
+        // with m_mutex released, instead of wait_idle() under the mutex. m_presentSerial keeps two presenters (window loop, frame dump) from interleaving.
+        bool m_presentUnlock = []() { const char *v = std::getenv("PS2X_GS_PRESENT_UNLOCK"); return v && *v && *v != '0'; }();
+        std::mutex m_presentSerial;
     };
 }
 

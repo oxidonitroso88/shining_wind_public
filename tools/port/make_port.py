@@ -8,7 +8,7 @@ Stages (run in this order; `--stage` runs one of them, they are re-runnable):
   recomp     builds the recompiler (ps2_recomp) into <work>/recomp-build
   generate   recompiles the main program with data/shining_wind_function_map.csv + data/shining_wind.toml.in into ps2xRuntime/src/runner
   overlays   the 11 code overlays and the supplementary functions (tools/overlay) into ps2xRuntime/src/runner_overlays
-  gs         fetches parallel-gs (pinned commit), applies third_party_patches/parallel-gs (0001-0004: HD texture replacement and x4 output)
+  gs         fetches parallel-gs (pinned commit), applies third_party_patches/parallel-gs (0001-0005 and 0008: HD texture replacement, x4 output, sampler_feedback fix for AMD)
              and regenerates its embedded shaders with slangmosh
   build      configures and builds ps2EntryRunner (about 25-30 minutes, 2 jobs) into <work>/runtime-build
   package    copies the executable and its DLLs to <dist> (ShiningWind.exe) with the licence files
@@ -238,8 +238,36 @@ def stage_gs(c):
     else:
         print("  parallel-gs already present: %s" % PGS_DIR)
     base = ROOT / "third_party_patches" / "parallel-gs"
-    for p in (base / "experimental" / "0003-x4-scanout-output.patch", base / "experimental" / "0004-x4-uncommitted-work-20261027.patch"):
-        if c.run("gs-check-" + p.name, ["git", "apply", "--check", "--reverse", p], cwd=PGS_DIR, check=False) == 0:
+
+    def applied(p):  # the reverse patch applies = it is already in the tree (also when the checkout has CRLF line endings)
+        return any(c.run("gs-check-" + p.name, ["git", "apply", "--check", "--reverse"] + w + [p], cwd=PGS_DIR, check=False) == 0 for w in ([], ["--ignore-whitespace"]))
+
+    def has_x4_marker():  # the tree already holds the x4 work even if the patches no longer match it byte for byte (own build, older/newer variant)
+        try:
+            return "high_resolution_scanout_log2" in (PGS_DIR / "gs" / "gs_interface.hpp").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+
+    # 0001/0002 come with the fetch script. Patches added later to the folder (0005...) are applied here, idempotently, because a checkout that already exists
+    # (an earlier make_port run) would otherwise never get them. 0003 + 0004 (x4) are experimental and go on top of each other: 0004 changes the hunks of 0003, so
+    # once 0004 is in the tree the reverse check of 0003 can no longer succeed: judge the pair by 0004 alone (re-running this stage used to fail on 0003).
+    # If neither patch can be recognised but the x4 marker is in the tree, the x4 work is left exactly as it is (never re-applied, never reset) and only the
+    # remaining patches (0005) are applied: they touch other files.
+    x4 = [base / "experimental" / "0003-x4-scanout-output.patch", base / "experimental" / "0004-x4-uncommitted-work-20261027.patch"]
+    later = [p for p in sorted(base.glob("*.patch")) if p.name[:4] not in ("0001", "0002")]
+    if applied(x4[1]):
+        todo_x4 = []
+        print("  already applied: %s, %s" % (x4[0].name, x4[1].name))
+    elif has_x4_marker():
+        todo_x4 = []
+        print("  x4 work already in the tree (marker high_resolution_scanout_log2): 0003/0004 left untouched")
+    elif applied(x4[0]):
+        todo_x4 = [x4[1]]
+        print("  already applied: %s" % x4[0].name)
+    else:
+        todo_x4 = x4
+    for p in later + todo_x4:
+        if applied(p):
             print("  already applied: %s" % p.name)
             continue
         c.run("gs-apply-" + p.name, ["git", "apply", "--whitespace=nowarn", p], cwd=PGS_DIR)

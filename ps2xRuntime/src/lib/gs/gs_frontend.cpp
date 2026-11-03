@@ -1,3 +1,4 @@
+#include "ps2_perf.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/tex_provenance.h"
 #include "runtime/gs/gs_async_backend.h"
@@ -792,8 +793,11 @@ void GS::latchHostPresentationFrame()
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
-            m_backend->Flush();
-            m_backend->Sync(GSSyncReason::Presentation);
+            {
+                const ps2perf::Scope perfFlush(ps2perf::S::MainFlushSync);
+                m_backend->Flush();
+                m_backend->Sync(GSSyncReason::Presentation);
+            }
             frame = m_backend->Present(request);
         }
     }
@@ -829,6 +833,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t *outSourceFbp,
                                           bool *outUsedPreferred) const
 {
+    const ps2perf::Scope perfScope(ps2perf::S::MainFrameCopy);
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
@@ -888,7 +893,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const ps2perf::Scope perfScope(ps2perf::S::EeGsFrontend, sizeBytes);
+    ps2perf::TimedGuard<std::recursive_mutex> lock(m_stateMutex, ps2perf::S::EeFrontendLock);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
@@ -1028,7 +1034,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const ps2perf::Scope perfScope(ps2perf::S::EeGsFrontend, sizeBytes);
+    ps2perf::TimedGuard<std::recursive_mutex> lock(m_stateMutex, ps2perf::S::EeFrontendLock);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
 
@@ -1087,7 +1094,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const ps2perf::Scope perfScope(ps2perf::S::EeGsFrontend, sizeBytes);
+    ps2perf::TimedGuard<std::recursive_mutex> lock(m_stateMutex, ps2perf::S::EeFrontendLock);
     if (data && sizeBytes != 0 && m_backend)
         if (GSRawTap *tap = gsRawTap())
             tap->OnImageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
@@ -1368,7 +1376,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const ps2perf::Scope perfScope(ps2perf::S::EeGsFrontend);
+    ps2perf::TimedGuard<std::recursive_mutex> lock(m_stateMutex, ps2perf::S::EeFrontendLock);
     if (GSRawTap *tap = gsRawTap())
         tap->OnRegister(regAddr, value);
     writeRegisterUnlocked(regAddr, value);

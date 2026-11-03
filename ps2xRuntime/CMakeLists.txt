@@ -399,6 +399,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_overlay.cpp
     src/lib/ps2_call_trace.cpp
     src/lib/ps2_text_pitch.cpp
+    src/lib/ps2_screenshot_path.cpp
     src/lib/ps2_story_text.cpp
     src/lib/ps2_script_trace.cpp
     src/lib/ps2_soul_session.cpp
@@ -416,6 +417,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_perf.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
@@ -582,6 +584,18 @@ if(PS2X_GS_PARALLEL)
     target_link_libraries(ps2_runtime PRIVATE parallel-gs)
     target_include_directories(ps2_runtime PRIVATE "${PS2X_PARALLEL_GS_DIR}/gs")
     target_compile_definitions(ps2_runtime PRIVATE PS2X_GS_PARALLEL=1)
+
+    # Diagnostic symbols (default OFF). Only the GPU/runtime libraries get /Z7 (no PDB sharing, optimisations untouched) so the generated runner is NOT
+    # recompiled; ps2EntryRunner links with /DEBUG (PDB) and /MAP (offset -> function table, readable without a debugger). See PS2X_GS_VKLOG.
+    option(PS2X_DEBUG_SYMBOLS "Emit PDB/MAP for the runtime and GPU libraries (Release stays optimised)" OFF)
+    if(PS2X_DEBUG_SYMBOLS AND MSVC)
+        foreach(_t ps2_runtime parallel-gs granite-vulkan granite-util granite-math granite-volk)
+            if(TARGET ${_t})
+                target_compile_options(${_t} PRIVATE /Z7)
+            endif()
+        endforeach()
+        target_link_options(ps2EntryRunner PRIVATE /DEBUG:FULL /OPT:REF /OPT:ICF /MAP)
+    endif()
 endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE

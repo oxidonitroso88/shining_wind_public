@@ -239,6 +239,20 @@ int main(int argc, char *argv[])
             ps2x::errlog::install(launchOptions.dataDir, logHeader, !ps2x::launch::noUsableErrorOutput());
         }
 #endif
+        // PS2X_STDIO_NULL=1 (diagnostic A/B, off by default): every std::cerr / std::cout character is discarded (after the error log, if any, was installed)
+        // so the cost of the stream logging can be measured in isolation. printf/fprintf output (the PS2X_PERF report) is not affected.
+        if (const char *nullIo = std::getenv("PS2X_STDIO_NULL"); nullIo && nullIo[0] && nullIo[0] != '0')
+        {
+            struct NullBuf : std::streambuf
+            {
+                int_type overflow(int_type ch) override { return traits_type::not_eof(ch); }
+                std::streamsize xsputn(const char *, std::streamsize n) override { return n; }
+            };
+            static NullBuf nullBuf;
+            static std::streambuf *keepErr = std::cerr.rdbuf(&nullBuf), *keepOut = std::cout.rdbuf(&nullBuf), *keepLog = std::clog.rdbuf(&nullBuf);
+            std::atexit([] { std::cerr.rdbuf(keepErr); std::cout.rdbuf(keepOut); std::clog.rdbuf(keepLog); });
+            std::fprintf(stderr, "[diag] PS2X_STDIO_NULL=1: std::cerr/std::cout/std::clog output is discarded\n");
+        }
         // --disc <image>: check the ELF inside the image, then copy the game files once into the data folder.
         ps2x::launch::resolveImage(launchOptions);
         if (launchOptions.error.empty() && launchOptions.discGiven && launchOptions.verify)

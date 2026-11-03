@@ -76,6 +76,16 @@ namespace ps2
         void setDmaSink(DmaSink sink) { m_sink = std::move(sink); }
         void setInterruptHook(InterruptHook hook) { m_interrupt = std::move(hook); }
 
+        // OUT FIFO byte queue implementation (experiment, PS2X_IPU_FASTBUF; read once per instance):
+        //   0 = std::deque<uint8_t> (original, reference behaviour; default)
+        //   1 = contiguous buffer with a read offset (no per-byte deque work, no temporary copy when pushing to the sink)
+        //   2 = verification: the deque stays authoritative and the contiguous buffer is compared byte for byte at every operation
+        // Changing the mode empties the queue (call it before use). fastBufMismatches() counts the differences seen in mode 2 (must stay 0).
+        void setOutputMode(int mode);
+        int outputMode() const { return m_outMode; }
+        uint64_t fastBufMismatches() const { return m_verifyMismatch; }
+        uint64_t fastBufVerifiedBytes() const { return m_verifyBytes; }
+
         // Power-on reset (also clears the quantiser matrices and the VQ CLUT).
         void reset();
 
@@ -154,7 +164,11 @@ namespace ps2
         // --- output -----------------------------------------------------------------------------------
         bool pushOutput();
         void appendOutput(const uint8_t *data, size_t bytes);
-        bool outputHasRoom() const { return m_out.size() <= kFifoQwords * 16u; }
+        bool outputHasRoom() const { return outSize() <= kFifoQwords * 16u; }
+        size_t outSize() const { return m_outMode == 1 ? m_outBuf.size() - m_outHead : m_out.size(); }
+        void outClear();
+        void outDropFast(size_t bytes);
+        void verifyFront(const uint8_t *expected, size_t bytes);
 
         // --- state ------------------------------------------------------------------------------------
         DmaSource m_source;
@@ -169,7 +183,12 @@ namespace ps2
         Snapshot m_snapshot;
         std::vector<std::array<uint8_t, 16>> m_attemptPulled;
 
-        std::deque<uint8_t> m_out;
+        std::deque<uint8_t> m_out;     // mode 0 and 2
+        std::vector<uint8_t> m_outBuf; // mode 1 and 2: bytes [m_outHead, size) are queued
+        size_t m_outHead = 0;
+        int m_outMode = 0;
+        uint64_t m_verifyBytes = 0;
+        uint64_t m_verifyMismatch = 0;
 
         uint32_t m_ctrl = 0; // stored bits (IDP, AS, IVF, QST, MP1, PCT, ECD, SCD)
         uint32_t m_cbp = 0;

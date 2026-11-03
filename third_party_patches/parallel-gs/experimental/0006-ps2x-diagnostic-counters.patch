@@ -1,0 +1,214 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 0a4e2ed..3c7b219 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -6,6 +6,7 @@
+ #include <vector>
+ #include "page_tracker.hpp"
+ #include "gs_interface.hpp"
++#include "ps2x_diag.hpp"
+ #include "gs_util.hpp"
+ #include "shaders/swizzle_utils.h"
+ #include "muglm/muglm_impl.hpp"
+@@ -133,6 +134,7 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
+ 
+ void GSInterface::flush_render_pass(FlushReason reason)
+ {
++	ps2xdiag::notePass(static_cast<int>(reason), render_pass.primitive_count);
+ 	ParallelGS::RenderPass rp = {};
+ 
+ 	if (render_pass.primitive_count)
+@@ -415,6 +417,7 @@ void GSInterface::flush(PageTrackerFlushFlags flags, FlushReason reason)
+ 	// For pressure flushes, we need to ensure GPU is kicked.
+ 	if (reason == FlushReason::PressureFlush)
+ 	{
++		ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_PRESSURE);
+ 		uint64_t value = tracker.mark_submission_timeline();
+ 		renderer.flush_submit(value);
+ 		if (debug_mode.deterministic_timeline_query)
+@@ -3253,6 +3256,7 @@ void GSInterface::flush_pending_transfer(bool keep_alive)
+ 					if (host_timeline == UINT64_MAX)
+ 					{
+ 						host_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
++						ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_HOST);
+ 						renderer.flush_submit(host_timeline);
+ 					}
+ 					renderer.wait_timeline(host_timeline);
+@@ -3421,6 +3425,7 @@ void GSInterface::init_transfer()
+ 		if (host_timeline == UINT64_MAX)
+ 		{
+ 			host_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
++			ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_HOST);
+ 			renderer.flush_submit(host_timeline);
+ 			if (debug_mode.deterministic_timeline_query)
+ 				renderer.wait_timeline(host_timeline);
+@@ -4382,6 +4387,7 @@ void *GSInterface::map_vram_write(size_t offset, size_t size)
+ 	if (host_write_timeline == UINT64_MAX)
+ 	{
+ 		host_write_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
++		ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_HOST);
+ 		renderer.flush_submit(host_write_timeline);
+ 	}
+ 
+@@ -4428,6 +4434,7 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
+ 	if (host_read_timeline == UINT64_MAX)
+ 	{
+ 		host_read_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
++		ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_HOST);
+ 		renderer.flush_submit(host_read_timeline);
+ 	}
+ 
+@@ -4446,6 +4453,7 @@ void GSInterface::flush()
+ {
+ 	flush_pending_transfer(true);
+ 	uint64_t value = tracker.mark_submission_timeline();
++	ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_EXPLICIT);
+ 	renderer.flush_submit(value);
+ 	if (debug_mode.deterministic_timeline_query)
+ 		renderer.wait_timeline(value);
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 5952ab3..116a8f0 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: LGPL-3.0+
+ 
+ #include "gs_renderer.hpp"
++#include "ps2x_diag.hpp"
+ #include "logging.hpp"
+ #include "gs_interface.hpp"
+ #include "gs_registers_debug.hpp"
+@@ -1055,10 +1056,12 @@ void GSRenderer::wait_timeline(uint64_t value)
+ 	if (enable_timestamps && device)
+ 		start_ts = device->write_calibrated_timestamp();
+ 
++	const ps2xdiag::Stopwatch tlTimer;
+ 	std::unique_lock<std::mutex> holder{timeline_lock};
+ 	timeline_cond.wait(holder, [this, value]() {
+ 		return timeline_value.load(std::memory_order_relaxed) >= value;
+ 	});
++	ps2xdiag::noteTimelineWait(tlTimer.ns());
+ 
+ 	if (enable_timestamps && device)
+ 	{
+@@ -1117,6 +1120,9 @@ void GSRenderer::flush_submit(uint64_t value)
+ {
+ 	if (!device)
+ 		return;
++	ps2xdiag::diag().submitCalls.fetch_add(1, std::memory_order_relaxed);
++	if (value == 0)
++		ps2xdiag::noteSubmit(ps2xdiag::ORIGIN_INTERNAL);
+ 
+ 	Vulkan::QueryPoolHandle start_ts, end_ts;
+ 	if (enable_timestamps)
+@@ -1213,7 +1219,11 @@ void GSRenderer::flush_submit(uint64_t value)
+ 	// If we have a timeline trace, we'd like it to be somewhat readable.
+ 	// Only do garbage collection at frame boundaries.
+ 	if (!device->get_system_handles().timeline_trace_file)
++	{
++		const ps2xdiag::Stopwatch nfcTimer;
+ 		device->next_frame_context();
++		ps2xdiag::noteNextFrameContext(nfcTimer.ns());
++	}
+ 
+ 	log_timestamps();
+ 	check_bug_feedback();
+diff --git a/gs/ps2x_diag.hpp b/gs/ps2x_diag.hpp
+new file mode 100644
+index 0000000..f3353d5
+--- /dev/null
++++ b/gs/ps2x_diag.hpp
+@@ -0,0 +1,93 @@
++#pragma once
++// ps2x diagnostic counters (perf 0016). Read-only instrumentation of how the CPU side of parallel-gs synchronises with the GPU: nothing here changes control flow.
++// Written by the thread that feeds the GS (relaxed atomics, a few increments per flush) and read by the runtime's perf report (PS2X_PERF).
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace ps2xdiag
++{
++	// FlushReason values (page_tracker.hpp) in declaration order
++	constexpr int kReasons = 7; // FBPointer, Overflow, TextureHazard, CopyHazard, SubmissionFlush, PressureFlush, HostAccess
++
++	enum SubmitOrigin : int
++	{
++		ORIGIN_INTERNAL = 0, // GSRenderer-internal flush_submit(0): scanout/vsync, readbacks, palette/cache paths
++		ORIGIN_EXPLICIT = 1, // GSInterface::flush()
++		ORIGIN_PRESSURE = 2, // PressureFlush
++		ORIGIN_HOST = 3,     // HostAccess (host reads/writes of GPU-owned VRAM pages)
++		ORIGIN_COUNT = 4
++	};
++
++	struct Counters
++	{
++		// GSRenderer::flush_submit
++		std::atomic<uint64_t> submitCalls{0};
++		std::atomic<uint64_t> submitByOrigin[ORIGIN_COUNT]{};
++		// Device::next_frame_context() as called from flush_submit: includes the wait for the GPU to finish the work recorded one ring turn ago (4 contexts).
++		std::atomic<uint64_t> nfcCalls{0};
++		std::atomic<uint64_t> nfcNs{0};
++		std::atomic<uint64_t> nfcMaxNs{0};
++		std::atomic<uint64_t> nfcOver[4]{}; // calls that took longer than 0.2 ms, 1 ms, 4 ms, 16 ms
++		// GSRenderer::wait_timeline (CPU waits for a GPU timeline value: host access to GPU data)
++		std::atomic<uint64_t> tlCalls{0};
++		std::atomic<uint64_t> tlNs{0};
++		std::atomic<uint64_t> tlMaxNs{0};
++		// GSInterface::flush_render_pass(reason): every call, and the ones that really had primitives
++		std::atomic<uint64_t> passCalls[kReasons]{};
++		std::atomic<uint64_t> passNonEmpty[kReasons]{};
++		std::atomic<uint64_t> passPrims[kReasons]{};
++	};
++
++	// one instance shared by every translation unit (parallel-gs is built before C++17: no inline variables)
++	inline Counters &diag() noexcept
++	{
++		static Counters c;
++		return c;
++	}
++
++	inline void raiseMax(std::atomic<uint64_t> &m, uint64_t v) noexcept
++	{
++		uint64_t cur = m.load(std::memory_order_relaxed);
++		while (v > cur && !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
++	}
++	inline void noteSubmit(int origin) noexcept
++	{
++		diag().submitByOrigin[origin].fetch_add(1, std::memory_order_relaxed);
++	}
++	inline void noteNextFrameContext(uint64_t ns) noexcept
++	{
++		diag().nfcCalls.fetch_add(1, std::memory_order_relaxed);
++		diag().nfcNs.fetch_add(ns, std::memory_order_relaxed);
++		raiseMax(diag().nfcMaxNs, ns);
++		static constexpr uint64_t kLimits[4] = { 200000ull, 1000000ull, 4000000ull, 16000000ull };
++		for (int i = 0; i < 4; ++i)
++			if (ns > kLimits[i])
++				diag().nfcOver[i].fetch_add(1, std::memory_order_relaxed);
++	}
++	inline void noteTimelineWait(uint64_t ns) noexcept
++	{
++		diag().tlCalls.fetch_add(1, std::memory_order_relaxed);
++		diag().tlNs.fetch_add(ns, std::memory_order_relaxed);
++		raiseMax(diag().tlMaxNs, ns);
++	}
++	inline void notePass(int reason, uint32_t primitives) noexcept
++	{
++		if (reason < 0 || reason >= kReasons)
++			return;
++		diag().passCalls[reason].fetch_add(1, std::memory_order_relaxed);
++		if (primitives)
++		{
++			diag().passNonEmpty[reason].fetch_add(1, std::memory_order_relaxed);
++			diag().passPrims[reason].fetch_add(primitives, std::memory_order_relaxed);
++		}
++	}
++	struct Stopwatch
++	{
++		std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++		uint64_t ns() const noexcept
++		{
++			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++		}
++	};
++}

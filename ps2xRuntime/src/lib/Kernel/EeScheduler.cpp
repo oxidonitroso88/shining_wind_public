@@ -14,6 +14,7 @@
 #include "ps2x/iop/audio_output.h"
 
 #include "ps2_log.h"
+#include "ps2_perf_irq.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
@@ -132,6 +133,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_alarms.clear();
     m_intcHandlers.clear();
     m_dmacHandlers.clear();
+    ps2perf::irqCleared();
     m_nextThreadId = kFirstThreadId;
     m_nextInvocationThreadId = -1;
     m_nextSemaphoreId = 1;
@@ -380,6 +382,7 @@ if (context.pc == 0x116400u)
         if (sifResumeTraceRemaining && running->invocations.empty())
         {
             --sifResumeTraceRemaining;
+            if (ps2perf::sifTrace())
             std::cerr << "[SIF:guest-resume] pc=0x" << std::hex << context.pc
                       << " ra=0x" << getRegU32(&context,31) << std::dec << '\n';
         }
@@ -395,7 +398,7 @@ if (context.pc == 0x116400u)
         } traceScope;
         ps2SifGuestTraceActive = !running->invocations.empty() &&
             running->invocations.back().kind == GuestInvocationKind::SifCommand;
-        if (ps2SifGuestTraceActive && ps2SifGuestTraceDispatches++ < 96)
+        if (ps2SifGuestTraceActive && ps2SifGuestTraceDispatches++ < 96 && ps2perf::sifTrace())
             std::cerr << "[SIF:guest-dispatch] pc=0x" << std::hex << context.pc
                       << " a0=0x" << getRegU32(&context,4) << " a1=0x" << getRegU32(&context,5)
                       << std::dec << '\n';
@@ -1632,8 +1635,18 @@ int EeScheduler::addIrqHandler(bool dmac,
     {
         return KE_ERROR;
     }
-    std::cerr << "[irq] add " << (dmac ? "DMAC" : "INTC") << " handler id=" << id << " cause=" << cause << " handler=0x" << std::hex << handler
-              << std::dec << " registered=" << (m_runtime.hasFunction(handler) ? 1 : 0) << std::endl;
+    // The game registers ~20 DMAC handlers/s; one synchronous stderr line each blocked the game thread on slow consoles (perf 0012, Vega).
+    // The first 32 lines are kept, then one every 512 registrations (with the running total). PS2X_LOG_VERBOSE=1 prints every one.
+    {
+        static const bool verbose = [] { const char *v = std::getenv("PS2X_LOG_VERBOSE"); return v && v[0] && !(v[0] == '0' && !v[1]); }();
+        static uint64_t added = 0;
+        const uint64_t n = ++added;
+        if (verbose || n <= 32u || (n & 511u) == 0u)
+        {
+            std::cerr << "[irq] add " << (dmac ? "DMAC" : "INTC") << " handler id=" << id << " cause=" << cause << " handler=0x" << std::hex << handler
+                      << std::dec << " registered=" << (m_runtime.hasFunction(handler) ? 1 : 0) << " (registration #" << n << ")" << std::endl;
+        }
+    }
     int &head = dmac ? m_dmacHeadOrder : m_intcHeadOrder;
     int &tail = dmac ? m_dmacTailOrder : m_intcTailOrder;
     handlers.emplace(id,
@@ -1645,6 +1658,7 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   sp,
                                   true,
                                   append ? ++tail : --head});
+    ps2perf::irqAdded(dmac, cause);
     return id;
 }
 
@@ -1656,6 +1670,7 @@ int EeScheduler::removeIrqHandler(bool dmac, uint32_t cause, int id)
     if (it != handlers.end() && it->second.cause == cause)
     {
         handlers.erase(it);
+        ps2perf::irqRemoved(dmac, cause);
     }
     return KE_OK;
 }
@@ -1698,6 +1713,12 @@ bool EeScheduler::queueSifPacket(std::function<bool(bool)> begin, std::function<
     for (const auto &[id, handler] : m_dmacHandlers)
         if (handler.enabled && handler.cause == 5 && handler.handler && m_runtime.hasFunction(handler.handler))
             matching.push_back(handler);
+    {
+        auto &st = ps2perf::g_irq[1];
+        st.sifCalls.fetch_add(1, std::memory_order_relaxed);
+        st.sifIterated.fetch_add(m_dmacHandlers.size(), std::memory_order_relaxed);
+        st.sifMatched.fetch_add(matching.size(), std::memory_order_relaxed);
+    }
     if (matching.empty()) return false;
     std::sort(matching.begin(), matching.end(), [](const auto &a, const auto &b) { return a.order < b.order; });
     auto started = std::make_shared<bool>(false);
@@ -1752,6 +1773,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
                 std::cerr << "[irq] handler 0x" << std::hex << handler.handler << std::dec << " is not a registered function: interrupt skipped" << std::endl;
         }
     }
+    ps2perf::irqDispatched(dmac, cause, handlers.size(), static_cast<uint32_t>(matching.size()));
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
     for (const EeIrqHandler &handler : matching)

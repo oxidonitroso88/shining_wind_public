@@ -1,0 +1,15 @@
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 67ed3b7..45063b9 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -1667,7 +1667,9 @@ void GSRenderer::flush_readback(const uint32_t *page_indices, uint32_t num_indic
+ 
+ 	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+ 	            VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+-	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
++	// ps2x 0008: the next flush-readback writes the same CPU-side VRAM buffer again (WAW). Without TRANSFER_WRITE in the destination access mask Vulkan
++	// synchronization validation reports a hazard as soon as the previous readback is not waited for (PS2X_GS_PRESENT_UNLOCK=1).
+ 
+ 	cmd.end_region();
+ 	check_flush_stats();

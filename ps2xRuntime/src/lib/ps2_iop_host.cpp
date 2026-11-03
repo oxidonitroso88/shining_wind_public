@@ -599,6 +599,7 @@ bool PS2IopHostAdapter::deliverGuestSifPacket(uint32_t buffer, const void *packe
             std::memcpy(destination, bytes.data(), bytes.size());
             uint32_t command = 0;
             std::memcpy(&command, bytes.data() + 8, 4);
+            if (ps2perf::sifTrace())
             std::cerr << "[SIF:wire] EE buffer committed cmd=0x" << std::hex << command
                       << " buffer=0x" << buffer << " guest dispatcher begin" << std::dec << '\n';
             return true;
@@ -606,7 +607,8 @@ bool PS2IopHostAdapter::deliverGuestSifPacket(uint32_t buffer, const void *packe
         [this, generation]() {
             if (generation != m_sifDeliveryGeneration) return;
             m_sifDeliveryBusy = false;
-            std::cerr << "[SIF:wire] guest dispatcher complete\n";
+            if (ps2perf::sifTrace())
+                std::cerr << "[SIF:wire] guest dispatcher complete\n";
         });
     if (queued) m_sifDeliveryBusy = true;
     return queued;
@@ -614,6 +616,11 @@ bool PS2IopHostAdapter::deliverGuestSifPacket(uint32_t buffer, const void *packe
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 {
+    // Debug lines (CDVDFSV "SCMD GetError", "read lsn", ...) fire ~20+/s during normal play and each one is a synchronous stderr write; on slow
+    // consoles/disks that blocked the game thread (perf 0012 on the Vega: ZwWriteFile ~5 % of its samples). Off unless PS2X_LOG_VERBOSE=1.
+    static const bool verbose = [] { const char *v = std::getenv("PS2X_LOG_VERBOSE"); return v && v[0] && !(v[0] == '0' && !v[1]); }();
+    if (level == ps2x::iop::LogLevel::Debug && !verbose)
+        return;
     const char *prefix = "[ps2xIOP]";
     if (level == ps2x::iop::LogLevel::Warning)
     {

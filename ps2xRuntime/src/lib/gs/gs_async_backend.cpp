@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_async_backend.h"
+#include "ps2_perf.h"
 
 #include <algorithm>
 #include <utility>
@@ -85,7 +86,10 @@ void GSAsyncBackend::execute(Command &command)
 void GSAsyncBackend::enqueue(Command command, size_t weightBytes)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
-    m_idleCv.wait(lock, [this]() { return m_stop || (m_queue.size() < kMaxQueuedCommands && m_queuedBytes < kMaxQueuedBytes); });
+    {
+        const ps2perf::Scope perfScope(ps2perf::S::EeAsyncWait);
+        m_idleCv.wait(lock, [this]() { return m_stop || (m_queue.size() < kMaxQueuedCommands && m_queuedBytes < kMaxQueuedBytes); });
+    }
     m_queue.push_back(std::move(command));
     ++m_enqueuedCount;
     m_queuedBytes += weightBytes;

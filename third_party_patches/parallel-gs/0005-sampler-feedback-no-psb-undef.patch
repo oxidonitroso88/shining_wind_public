@@ -1,0 +1,46 @@
+diff --git a/gs/shaders/sampler_feedback.comp b/gs/shaders/sampler_feedback.comp
+index cead81f..58d3817 100644
+--- a/gs/shaders/sampler_feedback.comp
++++ b/gs/shaders/sampler_feedback.comp
+@@ -6,6 +6,7 @@
+ #extension GL_EXT_buffer_reference : require
+ #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+ #extension GL_EXT_spirv_intrinsics : require
++#extension GL_EXT_buffer_reference_uvec2 : require
+ 
+ #define PRIMITIVE_SETUP_QUALIFIER readonly
+ #define NEED_PRIMITIVE_SETUP
+@@ -40,11 +41,15 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer BitMaskBuff
+ 
+ const uint ENABLED_BIT = 1 << 0;
+ 
++// The three buffer addresses are stored as uvec2 (low word first), not as buffer_reference members: same 8-byte size/alignment and offsets in memory
++// (0, 8, 16), same bits. A struct of PhysicalStorageBuffer pointers that is copied around (this struct is returned through an `out` parameter) makes the
++// compiler emit OpUndef / OpPhi of PhysicalStorageBuffer pointer type, which crashes vkCreateShaderModule in AMD's Windows driver (Radeon Vega 7,
++// amdvlk64, Adrenalin 26.5.2). The pointers are materialised right where they are used, in allocate_block().
+ struct TextureAnalysis
+ {
+-    IndirectDispatch indirect_dispatch_va;
+-    WorkGroupBuffer indirect_workgroups_va;
+-    BitMaskBuffer indirect_bitmask_va;
++    uvec2 indirect_dispatch_va;
++    uvec2 indirect_workgroups_va;
++    uvec2 indirect_bitmask_va;
+     uvec2 size_minus_1;
+     u16vec2 base;
+     uint block_stride_layers;
+@@ -63,9 +68,13 @@ layout(push_constant) uniform Registers
+     int super_sample_offset;
+ } registers;
+ 
+-void allocate_block(IndirectDispatch dispatch_va, WorkGroupBuffer workgroup_va, BitMaskBuffer bitmask_va,
++void allocate_block(uvec2 dispatch_address, uvec2 workgroup_address, uvec2 bitmask_address,
+                     uvec2 block, uint stride, uint layers)
+ {
++    IndirectDispatch dispatch_va = IndirectDispatch(dispatch_address);
++    WorkGroupBuffer workgroup_va = WorkGroupBuffer(workgroup_address);
++    BitMaskBuffer bitmask_va = BitMaskBuffer(bitmask_address);
++
+     uint linear_block = block.x + block.y * stride;
+ 
+     uint mask = 1u << (linear_block & 31u);

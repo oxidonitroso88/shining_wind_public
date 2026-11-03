@@ -781,7 +781,7 @@ namespace ps2_stubs
                 if ((xfer.attr & 0x40) && xfer.size >= 16)
                 {
                     uint32_t header[4]{};
-                    if (readEeRange(rdram, xfer.src, header, sizeof(header)))
+                    if (readEeRange(rdram, xfer.src, header, sizeof(header)) && ps2perf::sifTrace())
                         std::cerr << "[SIF:wire] EE send cmd=0x" << std::hex << header[2]
                                   << " opt=0x" << header[3] << " src=0x" << xfer.src
                                   << " dst=0x" << xfer.dest << std::dec << '\n';

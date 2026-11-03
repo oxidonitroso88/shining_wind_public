@@ -279,13 +279,60 @@ namespace ps2
     // -------------------------------------------------------------------------------------------------
     Ipu::Ipu()
     {
+        if (const char *v = std::getenv("PS2X_IPU_FASTBUF"))
+            m_outMode = (v[0] == '1' || v[0] == '2') && !v[1] ? v[0] - '0' : 0;
         reset();
+    }
+
+    void Ipu::setOutputMode(int mode)
+    {
+        m_outMode = mode == 1 || mode == 2 ? mode : 0;
+        outClear();
+    }
+
+    void Ipu::outClear()
+    {
+        m_out.clear();
+        m_outBuf.clear();
+        m_outHead = 0;
+    }
+
+    // Removes `bytes` from the front of the contiguous buffer, keeping it compact.
+    void Ipu::outDropFast(size_t bytes)
+    {
+        m_outHead += bytes;
+        if (m_outHead >= m_outBuf.size())
+        {
+            m_outBuf.clear();
+            m_outHead = 0;
+        }
+        else if (m_outHead >= 4096u && m_outHead * 2u >= m_outBuf.size())
+        {
+            m_outBuf.erase(m_outBuf.begin(), m_outBuf.begin() + static_cast<std::ptrdiff_t>(m_outHead));
+            m_outHead = 0;
+        }
+    }
+
+    // Mode 2: the contiguous buffer must hold exactly the bytes the authoritative deque is about to hand over.
+    void Ipu::verifyFront(const uint8_t *expected, size_t bytes)
+    {
+        const size_t have = m_outBuf.size() - m_outHead;
+        const bool same = have >= bytes && std::memcmp(m_outBuf.data() + m_outHead, expected, bytes) == 0;
+        m_verifyBytes += bytes;
+        if (!same && m_verifyMismatch++ < 8u)
+            std::fprintf(stderr, "[ipu-fastbuf] MISMATCH: %zu bytes expected at the queue front, contiguous buffer holds %zu\n", bytes, have);
+        static uint64_t nextReport = 64ull << 20;
+        if (m_verifyBytes >= nextReport)
+        {
+            nextReport += 64ull << 20;
+            std::fprintf(stderr, "[ipu-fastbuf] verify: %llu MiB compared, %llu mismatches\n", static_cast<unsigned long long>(m_verifyBytes >> 20), static_cast<unsigned long long>(m_verifyMismatch));
+        }
     }
 
     void Ipu::reset()
     {
         clearInput();
-        m_out.clear();
+        outClear();
         m_ctrl = 0;
         m_cbp = 0;
         m_top = 0;
@@ -310,7 +357,7 @@ namespace ps2
 
     uint32_t Ipu::outFifoQwords() const
     {
-        return static_cast<uint32_t>(std::min<size_t>(kFifoQwords, m_out.size() / 16u));
+        return static_cast<uint32_t>(std::min<size_t>(kFifoQwords, outSize() / 16u));
     }
 
     uint32_t Ipu::ctrl() const
@@ -384,7 +431,7 @@ namespace ps2
             {
                 // Soft reset: FIFOs, bit pointer, thresholds, flags and the running command.
                 clearInput();
-                m_out.clear();
+                outClear();
                 m_cbp = 0;
                 m_top = 0;
                 m_cmdData = 0;
@@ -423,12 +470,25 @@ namespace ps2
 
     bool Ipu::readOutFifo(uint8_t *qword)
     {
-        if (m_out.size() < 16u)
+        if (outSize() < 16u)
             return false;
-        for (int i = 0; i < 16; ++i)
+        if (m_outMode == 1)
         {
-            qword[i] = m_out.front();
-            m_out.pop_front();
+            std::memcpy(qword, m_outBuf.data() + m_outHead, 16);
+            outDropFast(16);
+        }
+        else
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                qword[i] = m_out.front();
+                m_out.pop_front();
+            }
+            if (m_outMode == 2)
+            {
+                verifyFront(qword, 16);
+                outDropFast(16);
+            }
         }
         run();
         return true;
@@ -608,20 +668,40 @@ namespace ps2
     // -------------------------------------------------------------------------------------------------
     void Ipu::appendOutput(const uint8_t *data, size_t bytes)
     {
-        m_out.insert(m_out.end(), data, data + bytes);
+        if (m_outMode != 1)
+            m_out.insert(m_out.end(), data, data + bytes);
+        if (m_outMode != 0)
+            m_outBuf.insert(m_outBuf.end(), data, data + bytes);
     }
 
     bool Ipu::pushOutput()
     {
-        if (!m_sink || m_out.size() < 16u)
+        if (!m_sink || outSize() < 16u)
             return false;
-        const size_t qwords = m_out.size() / 16u;
+        const size_t qwords = outSize() / 16u;
+        if (m_outMode == 1)
+        {
+            // The sink only reads the bytes; nothing appends to the queue while it runs (appends happen inside runLoop, which is not re-entered).
+            const size_t acceptedFast = m_sink(m_outBuf.data() + m_outHead, qwords);
+            if (acceptedFast == 0)
+                return false;
+            outDropFast(acceptedFast * 16u);
+            return true;
+        }
         std::vector<uint8_t> tmp(qwords * 16u);
         std::copy(m_out.begin(), m_out.begin() + static_cast<std::ptrdiff_t>(tmp.size()), tmp.begin());
+        if (m_outMode == 2)
+        {
+            verifyFront(tmp.data(), tmp.size());
+            if (m_outBuf.size() - m_outHead != m_out.size() && m_verifyMismatch++ < 8u)
+                std::fprintf(stderr, "[ipu-fastbuf] MISMATCH: queue sizes differ (%zu vs %zu)\n", m_out.size(), m_outBuf.size() - m_outHead);
+        }
         const size_t accepted = m_sink(tmp.data(), qwords);
         if (accepted == 0)
             return false;
         m_out.erase(m_out.begin(), m_out.begin() + static_cast<std::ptrdiff_t>(accepted * 16u));
+        if (m_outMode == 2)
+            outDropFast(accepted * 16u);
         return true;
     }
 

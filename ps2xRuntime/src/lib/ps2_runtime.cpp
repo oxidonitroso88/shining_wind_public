@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "ps2_perf.h"
 #include "extras/extras_host.h"
 void ps2StartRipProfiler(void *threadHandle);
 void ps2StopRipProfiler();
@@ -505,6 +506,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     // A frame that fills the texture exactly (the high resolution scanouts) goes straight to the texture: no clear and no row copy of 18 MiB.
     const bool exactFit = !s_scratch.empty() && static_cast<int>(width) == s_texWidth && static_cast<int>(height) == s_texHeight &&
                           s_scratch.size() == static_cast<size_t>(s_texWidth) * static_cast<size_t>(s_texHeight) * 4u;
+    {
+    const ps2perf::Scope perfTexUpdate(ps2perf::S::MainTexUpdate);
     if (exactFit)
     {
         UpdateTexture(tex, s_scratch.data());
@@ -533,6 +536,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 
     UpdateTexture(tex, s_uploadBuffer.data());
+    }
     }
     // Debug aid: PS2X_DUMP_FRAME=<path prefix> saves the presented framebuffer as <prefix>_<n>.png at
     // upload counts 1, 60, 300, 900 and every 1800th afterwards (evidence of what the guest draws).
@@ -609,6 +613,9 @@ bool ps2x_dumpPresentationFramePng(PS2Runtime &runtime, const char *path)
     uint32_t width = 0u, height = 0u;
     if (!runtime.gs().copyLatchedHostPresentationFrame(pixels, width, height) || width == 0u || height == 0u)
         return false;
+    // the saved picture is opaque: a viewer must not show a transparent frame whatever the backend left in the alpha channel
+    for (size_t i = 3u; i < pixels.size(); i += 4u)
+        pixels[i] = 255u;
     Image image{};
     image.data = pixels.data();
     image.width = static_cast<int>(width);
@@ -2875,6 +2882,7 @@ void PS2Runtime::run()
 
     if (std::getenv("PS2X_RIP_PROFILE"))
         ps2StartRipProfiler(gameThread.native_handle());
+    ps2perf::startSampler(gameThread.native_handle());
 
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
@@ -2985,7 +2993,11 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        const uint64_t perfLoopStart = ps2perf::enabled() ? ps2perf::nowNs() : 0u;
+        {
+            const ps2perf::Scope perfUpload(ps2perf::S::MainUpload);
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+        }
         // aspect ratio of the picture (a frame produced at a higher internal resolution keeps the shape of the original picture)
         static uint32_t s_aspectWidth = 0u, s_aspectHeight = 0u;
         {
@@ -3021,6 +3033,18 @@ void PS2Runtime::run()
             std::cerr << "[hdpack] HD textures " << (hdpack::enabled() ? "ON" : "OFF") << std::endl;
         }
 
+        // F12: screenshot of what the game renders (its own picture at the internal resolution, no window borders) into <Pictures>\ShiningWind\ShiningWind_<date>.png.
+        if (IsKeyPressed(KEY_F12))
+        {
+            extern std::string ps2x_nextScreenshotPath();
+            const std::string shotPath = ps2x_nextScreenshotPath();
+            if (ps2x_dumpPresentationFramePng(*this, shotPath.c_str()))
+                std::cerr << "[screenshot] F12: " << shotPath << std::endl;
+            else
+                std::cerr << "[screenshot] F12: nothing to save yet" << std::endl;
+        }
+
+        const uint64_t perfDrawStart = ps2perf::enabled() ? ps2perf::nowNs() : 0u;
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -3081,7 +3105,17 @@ void PS2Runtime::run()
                 UnloadImage(img);
             }
         }
-        EndDrawing();
+        if (perfLoopStart)
+        {
+            const uint64_t perfEnd = ps2perf::nowNs();
+            ps2perf::add(ps2perf::S::MainDraw, perfEnd - perfDrawStart);
+            ps2perf::add(ps2perf::S::MainLoopBody, perfEnd - perfLoopStart);
+        }
+        {
+            const ps2perf::Scope perfEndDrawing(ps2perf::S::MainEndDrawing);
+            EndDrawing();
+        }
+        ps2perf::frameDone(eeScheduler().currentVSyncTick(), presentWidth, presentHeight);
 
         if (WindowShouldClose())
         {
@@ -3093,6 +3127,7 @@ void PS2Runtime::run()
 
     pc_extras::host::shutdown();
     requestStop();
+    ps2perf::stopSampler(); // before the join: the sampler suspends the game thread through its native handle
     if (gameThread.joinable())
     {
         gameThread.join();

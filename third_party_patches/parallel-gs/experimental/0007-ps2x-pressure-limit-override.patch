@@ -1,0 +1,64 @@
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 116a8f0..67ed3b7 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -861,6 +861,17 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
+ 		}
+ 	}
+ 
++	// ps2x 0017: PS2X_GS_IMG_PRESSURE_MB overrides the per-flush image-memory limit (default: 5 % of the device-local budget; 12 MiB on a Vega 7 iGPU).
++	if (const char *pe = getenv("PS2X_GS_IMG_PRESSURE_MB"))
++	{
++		const long long mb = atoll(pe);
++		if (mb > 0)
++		{
++			max_allocated_image_memory_per_flush = static_cast<VkDeviceSize>(mb) * 1024 * 1024;
++			LOGI("PS2X_GS_IMG_PRESSURE_MB=%lld: per-flush image memory limit overridden.\n", mb);
++		}
++	}
++
+ 	LOGI("Using image slab size of %llu MiB.\n",
+ 	     static_cast<unsigned long long>(max_image_slab_size / (1024 * 1024)));
+ 	LOGI("Using max allocated image memory per flush of %llu MiB.\n",
+@@ -889,6 +900,11 @@ void GSRenderer::check_flush_stats()
+ 	    stats.num_copies >= MaxPendingCopies ||
+ 	    stats.num_palette_updates >= MaxPendingPaletteUploads)
+ 	{
++		ps2xdiag::notePressureCause(
++		    stats.num_primitives >= MinimumPrimitivesForFlush, stats.num_render_passes >= MinimumRenderPassForFlush,
++		    stats.allocated_image_memory >= max_allocated_image_memory_per_flush,
++		    stats.allocated_scratch_memory >= MaximumAllocatedScratchMemory, stats.num_copies >= MaxPendingCopies,
++		    stats.num_palette_updates >= MaxPendingPaletteUploads);
+ #ifdef PARALLEL_GS_DEBUG
+ 		LOGI("Too much pending work, flushing:\n");
+ 		LOGI("  %u primitives\n", stats.num_primitives);
+diff --git a/gs/ps2x_diag.hpp b/gs/ps2x_diag.hpp
+index f3353d5..715b500 100644
+--- a/gs/ps2x_diag.hpp
++++ b/gs/ps2x_diag.hpp
+@@ -37,6 +37,10 @@ namespace ps2xdiag
+ 		std::atomic<uint64_t> passCalls[kReasons]{};
+ 		std::atomic<uint64_t> passNonEmpty[kReasons]{};
+ 		std::atomic<uint64_t> passPrims[kReasons]{};
++		// 0017: which limits of GSRenderer::check_flush_stats were exceeded when it asked for a pressure flush (a call can count several):
++		// primitives, render passes, image memory, scratch memory, copies, palette updates
++		std::atomic<uint64_t> pressureCause[6]{};
++		std::atomic<uint64_t> pressureCalls{0};
+ 	};
+ 
+ 	// one instance shared by every translation unit (parallel-gs is built before C++17: no inline variables)
+@@ -82,6 +86,14 @@ namespace ps2xdiag
+ 			diag().passPrims[reason].fetch_add(primitives, std::memory_order_relaxed);
+ 		}
+ 	}
++	inline void notePressureCause(bool prims, bool passes, bool image, bool scratch, bool copies, bool palette) noexcept
++	{
++		diag().pressureCalls.fetch_add(1, std::memory_order_relaxed);
++		const bool v[6] = { prims, passes, image, scratch, copies, palette };
++		for (int i = 0; i < 6; ++i)
++			if (v[i])
++				diag().pressureCause[i].fetch_add(1, std::memory_order_relaxed);
++	}
+ 	struct Stopwatch
+ 	{
+ 		std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();

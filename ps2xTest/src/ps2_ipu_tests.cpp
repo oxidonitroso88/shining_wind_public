@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "runtime/ps2_ipu.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -103,6 +104,92 @@ namespace
     }
 
     uint32_t le16(const std::vector<uint8_t> &v, size_t i) { return static_cast<uint32_t>(v[i * 2] | (v[i * 2 + 1] << 8)); }
+
+    // Everything observable from outside while a scenario runs: CTRL after every step, the bytes the DMA3 sink received and the bytes read through the 128-bit port.
+    struct FifoTrace
+    {
+        std::vector<uint32_t> ctrl;
+        std::vector<uint8_t> sunk;
+        std::vector<uint8_t> port;
+        int interrupts = 0;
+        uint64_t mismatches = 0;
+        uint64_t verifiedBytes = 0;
+        bool operator==(const FifoTrace &o) const { return ctrl == o.ctrl && sunk == o.sunk && port == o.port && interrupts == o.interrupts; }
+    };
+
+    // Runs the same input through the IPU with the given OUT FIFO queue mode. The sink accepts a repeating pattern of quadword counts (0 = refuses),
+    // so partial acceptance, refusals, port reads and resets are all exercised.
+    FifoTrace runFifoScenario(int mode, int scenario)
+    {
+        Rig r;
+        r.ipu.setOutputMode(mode);
+        FifoTrace tr;
+        const size_t pattern[] = {1, 3, 0, 2, 8, 0, 0, 5, 1};
+        size_t step = 0;
+        r.ipu.setDmaSink([&](const uint8_t *src, size_t qw) -> size_t {
+            const size_t limit = pattern[step++ % (sizeof(pattern) / sizeof(pattern[0]))];
+            const size_t n = std::min(qw, limit);
+            tr.sunk.insert(tr.sunk.end(), src, src + n * 16);
+            return n;
+        });
+        auto observe = [&]() { tr.ctrl.push_back(r.ipu.readRegister(0x10)); };
+        auto readPort = [&](int qwords) {
+            for (int i = 0; i < qwords; ++i)
+            {
+                uint8_t q[16];
+                if (!r.ipu.readOutFifo(q))
+                    break;
+                tr.port.insert(tr.port.end(), q, q + 16);
+            }
+            observe();
+        };
+        if (scenario == 0)
+        {
+            // CSC: 1024 B per macroblock through a sink that accepts irregular chunks; the port is read in between.
+            const size_t mbs = 40;
+            r.input.assign(mbs * 384 + 16 * 8, 0);
+            for (size_t m = 0; m < mbs; ++m)
+            {
+                std::memset(r.input.data() + m * 384, static_cast<int>(40 + m * 5), 256);
+                std::memset(r.input.data() + m * 384 + 256, static_cast<int>(100 + m), 128);
+            }
+            r.cmd(0u);
+            r.cmd((7u << 28) | static_cast<uint32_t>(mbs));
+            for (int i = 0; i < 400 && (r.ipu.readRegister(0x04) >> 31); ++i)
+            {
+                observe();
+                if (i % 3 == 0)
+                    readPort(2);
+                r.ipu.run();
+            }
+            observe();
+        }
+        else if (scenario == 1)
+        {
+            // BDEC (768 B per macroblock) with the sink closed so the port is the only drain, then a soft reset with data pending.
+            r.sinkOpen = false;
+            r.ipu.setDmaSink([&](const uint8_t *, size_t) -> size_t { return 0; });
+            BitWriter w;
+            for (int i = 0; i < 6; ++i)
+                w.put(flatIntraMacroblock());
+            r.input = w.finish();
+            r.cmd((2u << 28) | (1u << 27) | (1u << 26));
+            observe();
+            for (int i = 0; i < 40; ++i)
+                readPort(1 + (i % 4));
+            r.cmd((2u << 28) | (1u << 27) | (1u << 26));
+            observe();
+            r.ipu.writeRegister(0x10, Ipu::kCtrlRst); // soft reset while the OUT FIFO holds data
+            observe();
+            readPort(3);
+        }
+        r.ipu.run();
+        observe();
+        tr.interrupts = r.interrupts;
+        tr.mismatches = r.ipu.fastBufMismatches();
+        tr.verifiedBytes = r.ipu.fastBufVerifiedBytes();
+        return tr;
+    }
 } // namespace
 
 void register_ps2_ipu_tests()
@@ -401,5 +488,22 @@ void register_ps2_ipu_tests()
             t.Equals(ipu.readRegister(0x10) & 0xFu, 8u, "the FIFO holds 8 quadwords");
             t.IsFalse(ipu.writeInFifo(q), "a full FIFO rejects more data");
         });
+    });
+    MiniTest::Case("PS2IpuFastBuf", [](TestCase &tc)
+    {
+        for (int scenario = 0; scenario < 2; ++scenario)
+        {
+            tc.Run(scenario == 0 ? "OUT FIFO modes 0/1/2 agree: CSC through a partially accepting sink" : "OUT FIFO modes 0/1/2 agree: BDEC drained by the port, then reset", [scenario](TestCase &t)
+            {
+                const FifoTrace reference = runFifoScenario(0, scenario);
+                const FifoTrace fast = runFifoScenario(1, scenario);
+                const FifoTrace verify = runFifoScenario(2, scenario);
+                t.IsTrue(!reference.ctrl.empty() && (!reference.sunk.empty() || !reference.port.empty()), "the scenario produced output");
+                t.IsTrue(fast == reference, "mode 1 (contiguous) is observably identical to mode 0 (deque)");
+                t.IsTrue(verify == reference, "mode 2 (verify) is observably identical to mode 0");
+                t.Equals(static_cast<int>(verify.mismatches), 0, "no byte or size mismatch found by the verifier");
+                t.IsTrue(verify.verifiedBytes > 0 || scenario == 1, "the verifier compared bytes");
+            });
+        }
     });
 }
